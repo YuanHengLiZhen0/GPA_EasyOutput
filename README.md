@@ -43,6 +43,9 @@ Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Ana
 |------|------|--------|------|
 | `min_call` | int | 1 | 起始事件索引（包含，从 1 开始） |
 | `max_call` | int | -1 | 结束事件索引（包含），-1 表示无上限 |
+| `enable_skinning` | int | 0 | 蒙皮计算开关（0=关闭，1=开启） |
+| `skeleton_resource_id` | int | -1 | 骨骼数据CBV的resource_id（-1=自动检测size=768） |
+| `skeleton_view_id` | int | 0 | 骨骼数据CBV的view_id（需与resource_id同时匹配） |
 
 ### 示例
 
@@ -337,6 +340,13 @@ def desc():
 ---
 
 ## 更新日志
+
+### 2024-12-28 v2.1
+
+- **骨骼数据缓冲区参数化**：新增 `skeleton_resource_id` 和 `skeleton_view_id` 参数
+  - `skeleton_resource_id`: 指定骨骼数据CBV的resource_id（-1=自动检测size=768）
+  - `skeleton_view_id`: 指定骨骼数据CBV的view_id（需与resource_id同时匹配）
+- 支持通过resource_id + view_id精确定位骨骼数据缓冲区
 
 ### 2024-12-28 v2.0
 

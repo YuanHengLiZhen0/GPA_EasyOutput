@@ -1756,7 +1756,7 @@ def export_shaders(program, output_dir, event_index):
     return exported_shaders
 
 
-def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, call, output_dir, event_index, call_desc, skeleton_data=None, cbv_resources=None, enable_skinning=True):
+def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, call, output_dir, event_index, call_desc, skeleton_data=None, cbv_resources=None, enable_skinning=True, skeleton_resource_id=-1, skeleton_view_id=0):
     """
     使用 IBV (Index Buffer View) 和 VBV (Vertex Buffer View) 资源生成 mesh
     支持蒙皮计算 (当提供骨骼数据且 enable_skinning=True 时)
@@ -1770,6 +1770,8 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
         call_desc: 调用描述
         skeleton_data: 骨骼矩阵数据 (float4 数组)，可选
         cbv_resources: CBV 类型的缓冲区资源列表，用于提取骨骼数据
+        skeleton_resource_id: 骨骼数据缓冲区的resource_id（-1表示自动检测size=768）
+        skeleton_view_id: 骨骼数据缓冲区的view_id（需与resource_id同时匹配）
     """
     try:
         if not ibv_resource or not vbv_resources:
@@ -1905,29 +1907,54 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
         # 只有当 enable_skinning=True 时才进行蒙皮计算
         if enable_skinning:
             # 尝试从 CBV 获取骨骼矩阵数据
-            # 骨骼数据大小为 768 bytes (48 float4, 16 骨骼)
             if skeleton_data is None and cbv_resources:
-                for cbv in cbv_resources:
-                    cbv_desc = cbv.get_description()
-                    cbv_size = cbv_desc.get("size", 0)
+                target_cbv = None
+                
+                if skeleton_resource_id >= 0:
+                    # 使用指定的 resource_id 和 view_id 同时匹配
+                    for cbv in cbv_resources:
+                        cbv_desc = cbv.get_description()
+                        cbv_res_id = cbv_desc.get("resource_id", -1)
+                        cbv_view_id = cbv_desc.get("view_id", -1)
+                        
+                        if cbv_res_id == skeleton_resource_id and cbv_view_id == skeleton_view_id:
+                            target_cbv = cbv
+                            messages.debug(f"找到骨骼数据 CBV: resource_id={skeleton_resource_id}, view_id={skeleton_view_id}")
+                            break
                     
-                    # 检查是否是骨骼数据 (size == 768)
-                    if cbv_size == 768:
-                        try:
-                            cbv_request = BufferRequest(
-                                buffer=cbv,
-                                call=call,
-                                extract_before=False
-                            )
-                            cbv_result = resources_accessor.get_buffers_data([cbv_request], timeout=30000)
-                            
-                            if cbv_request in cbv_result:
-                                cbv_data = cbv_result[cbv_request].data
-                                skeleton_data = parse_skeleton_data(cbv_data, 0)
-                                messages.debug(f"从 CBV 提取骨骼数据: size=768, {len(skeleton_data)} 个 float4")
-                                break
-                        except Exception as e:
-                            messages.debug(f"提取骨骼数据失败: {str(e)}")
+                    if target_cbv is None:
+                        messages.debug(f"警告: 未找到匹配的骨骼数据 CBV (resource_id={skeleton_resource_id}, view_id={skeleton_view_id})")
+                else:
+                    # 自动检测: 查找 size == 768 的 CBV（兼容旧逻辑）
+                    for cbv in cbv_resources:
+                        cbv_desc = cbv.get_description()
+                        cbv_size = cbv_desc.get("size", 0)
+                        if cbv_size == 768:
+                            target_cbv = cbv
+                            cbv_res_id = cbv_desc.get("resource_id", -1)
+                            cbv_view_id = cbv_desc.get("view_id", -1)
+                            messages.debug(f"自动检测到骨骼数据 CBV: size=768, resource_id={cbv_res_id}, view_id={cbv_view_id}")
+                            break
+                
+                # 提取骨骼数据
+                if target_cbv:
+                    try:
+                        cbv_desc = target_cbv.get_description()
+                        cbv_size = cbv_desc.get("size", 0)
+                        cbv_res_id = cbv_desc.get("resource_id", -1)
+                        cbv_request = BufferRequest(
+                            buffer=target_cbv,
+                            call=call,
+                            extract_before=False
+                        )
+                        cbv_result = resources_accessor.get_buffers_data([cbv_request], timeout=30000)
+                        
+                        if cbv_request in cbv_result:
+                            cbv_data = cbv_result[cbv_request].data
+                            skeleton_data = parse_skeleton_data(cbv_data, 0)
+                            messages.debug(f"从 CBV 提取骨骼数据: resource_id={cbv_res_id}, size={cbv_size}, {len(skeleton_data)} 个 float4")
+                    except Exception as e:
+                        messages.debug(f"提取骨骼数据失败: {str(e)}")
             
             # 读取骨骼索引和权重（只读取需要的顶点数量）
             if bone_vbv and skeleton_data:
@@ -2181,7 +2208,9 @@ def build_resource_id_to_dxbc_name_map(resource_id_to_slot, dxbc_texture_map):
 
 def run(min_call: "起始事件索引（包含，从1开始）" = 1,
         max_call: "结束事件索引（包含），-1 表示无上限" = -1,
-        enable_skinning: "蒙皮计算开关（0=关闭，1=开启）" = 0):
+        enable_skinning: "蒙皮计算开关（0=关闭，1=开启）" = 0,
+        skeleton_resource_id: "骨骼数据缓冲区的resource_id（-1表示自动检测size=768）" = -1,
+        skeleton_view_id: "骨骼数据缓冲区的view_id（默认0）" = 0):
     """
     获取指定索引范围内的事件，导出所有纹理和缓冲区资源
     每个 event 的资源保存在以该 event ID 命名的文件夹下
@@ -2190,6 +2219,8 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
         min_call: 起始事件索引（包含，从1开始）
         max_call: 结束事件索引（包含），-1 表示无上限
         enable_skinning: 蒙皮计算开关（0=关闭，1=开启，默认 0）
+        skeleton_resource_id: 骨骼数据缓冲区的resource_id（-1表示自动检测size=768）
+        skeleton_view_id: 骨骼数据缓冲区的view_id（默认0，需与resource_id同时匹配）
     """
     
     api_log = plugin_api.get_api_log_accessor()
@@ -2469,7 +2500,9 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                     resources_accessor, ibv_resource, vbv_resources, call, input_dir, event_index, desc,
                     skeleton_data=None,  # 让函数自动从 CBV 提取
                     cbv_resources=cbv_resources,
-                    enable_skinning=(enable_skinning == 1)  # 0=关闭，1=开启
+                    enable_skinning=(enable_skinning == 1),  # 0=关闭，1=开启
+                    skeleton_resource_id=skeleton_resource_id,
+                    skeleton_view_id=skeleton_view_id
                 )
             
             # 如果 IBV/VBV 方式失败，尝试使用 geometry_info
