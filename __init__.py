@@ -2078,6 +2078,107 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
         return None
 
 
+def find_ps_set_shader_resources_before_event(all_calls, target_call):
+    """
+    查找目标event之前、上一个event之后的所有PSSetShaderResources调用
+    
+    参数:
+        all_calls: 所有calls列表
+        target_call: 目标event的call对象
+    
+    返回:
+        PSSetShaderResources调用列表
+    """
+    ps_set_srv_calls = []
+    
+    # 找到target_call在all_calls中的位置
+    target_idx = -1
+    for i, c in enumerate(all_calls):
+        if c == target_call:
+            target_idx = i
+            break
+    
+    if target_idx <= 0:
+        return ps_set_srv_calls
+    
+    # 从target_call往前遍历，直到遇到上一个event
+    for i in range(target_idx - 1, -1, -1):
+        c = all_calls[i]
+        desc = c.get_description()
+        name = desc.get('name', '')
+        
+        if desc.get('is_event', False):
+            # 遇到上一个event，停止
+            break
+        
+        if name == 'PSSetShaderResources':
+            ps_set_srv_calls.insert(0, c)  # 保持顺序
+    
+    return ps_set_srv_calls
+
+
+def build_resource_id_to_slot_map(ps_set_srv_calls):
+    """
+    从PSSetShaderResources调用中提取ppShaderResourceViews，
+    建立 resource_id -> slot_index 的映射
+    
+    参数:
+        ps_set_srv_calls: PSSetShaderResources调用列表
+    
+    返回:
+        dict: resource_id -> slot_index 映射
+    """
+    resource_id_to_slot = {}
+    
+    for call in ps_set_srv_calls:
+        desc = call.get_description()
+        arguments = desc.get('arguments', [])
+        
+        # 获取 StartSlot 参数
+        start_slot = 0
+        for arg in arguments:
+            if arg.get('name') == 'StartSlot':
+                start_slot = arg.get('value', 0)
+                break
+        
+        # 获取 ppShaderResourceViews 参数
+        for arg in arguments:
+            if arg.get('name') == 'ppShaderResourceViews':
+                views = arg.get('value', [])
+                if isinstance(views, list):
+                    for idx, view in enumerate(views):
+                        # view 是 {"name": "ppShaderResourceViews", "type": "uint32_t", "value": 989}
+                        if isinstance(view, dict):
+                            res_id = view.get('value', 0)
+                            if res_id and res_id != 0:
+                                slot_index = start_slot + idx
+                                resource_id_to_slot[res_id] = slot_index
+                break
+    
+    return resource_id_to_slot
+
+
+def build_resource_id_to_dxbc_name_map(resource_id_to_slot, dxbc_texture_map):
+    """
+    结合 resource_id -> slot 和 slot -> dxbc_name 映射，
+    建立 resource_id -> dxbc_name 的映射
+    
+    参数:
+        resource_id_to_slot: resource_id -> slot_index 映射
+        dxbc_texture_map: slot_index -> dxbc_name 映射
+    
+    返回:
+        dict: resource_id -> dxbc_name 映射
+    """
+    resource_id_to_name = {}
+    
+    for res_id, slot_index in resource_id_to_slot.items():
+        if slot_index in dxbc_texture_map:
+            resource_id_to_name[res_id] = dxbc_texture_map[slot_index]
+    
+    return resource_id_to_name
+
+
 def run(min_call: "起始事件索引（包含，从1开始）" = 1,
         max_call: "结束事件索引（包含），-1 表示无上限" = -1,
         enable_skinning: "蒙皮计算开关（0=关闭，1=开启）" = 0):
@@ -2213,9 +2314,31 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                                     pass
                         
                         if dxbc_texture_map:
-                            messages.debug(f"DXBC 纹理映射: {dxbc_texture_map}")
+                            messages.debug(f"DXBC slot->name 映射: {dxbc_texture_map}")
             
-            # 收集 inputs 中 view_id 为 0 的 SRV 纹理（保持原有顺序）
+            # ============ 从 PSSetShaderResources 建立 resource_id -> dxbc_name 映射 ============
+            resource_id_to_dxbc_name = {}
+            
+            if dxbc_texture_map:
+                # 查找该 event 之前的 PSSetShaderResources 调用
+                ps_set_srv_calls = find_ps_set_shader_resources_before_event(all_calls, call)
+                
+                if ps_set_srv_calls:
+                    # 从 PSSetShaderResources 提取 resource_id -> slot 映射
+                    resource_id_to_slot = build_resource_id_to_slot_map(ps_set_srv_calls)
+                    
+                    if resource_id_to_slot:
+                        messages.debug(f"PSSetShaderResources resource_id->slot 映射: {resource_id_to_slot}")
+                        
+                        # 结合两个映射，建立 resource_id -> dxbc_name 映射
+                        resource_id_to_dxbc_name = build_resource_id_to_dxbc_name_map(
+                            resource_id_to_slot, dxbc_texture_map
+                        )
+                        
+                        if resource_id_to_dxbc_name:
+                            messages.debug(f"最终 resource_id->dxbc_name 映射: {resource_id_to_dxbc_name}")
+            
+            # 收集 inputs 中的资源
             srv_textures_view0 = []
             other_inputs = []
             
@@ -2232,36 +2355,32 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                     else:
                         other_inputs.append(res)
             
-            # 将 DXBC 纹理按 slot 排序（t0, t1, t3, t6 -> 0, 1, 3, 6）
-            dxbc_texture_list = []
-            for slot_index, name in dxbc_texture_map.items():
-                dxbc_texture_list.append({"slot_index": slot_index, "name": name})
-            dxbc_texture_list.sort(key=lambda x: x["slot_index"])
-            
-            # 比对数量
-            messages.debug(f"view_id=0 的 SRV 纹理数量: {len(srv_textures_view0)}, DXBC 纹理数量: {len(dxbc_texture_list)}")
-            
-            # 按顺序一一对应：SRV 纹理顺序 <-> DXBC 纹理按 slot 排序后的顺序
+            # 导出 SRV 纹理，使用 resource_id -> dxbc_name 映射来命名
             for idx, res in enumerate(srv_textures_view0):
                 res_desc = res.get_description()
-                res_id = str(res_desc.get("resource_id"))
+                res_id = res_desc.get("resource_id")
+                res_id_str = str(res_id)
                 
-                # 按顺序获取对应的 DXBC 纹理名称
-                if idx < len(dxbc_texture_list):
-                    dxbc_info = dxbc_texture_list[idx]
-                    dxbc_name = dxbc_info["name"]
-                    dxbc_slot = dxbc_info["slot_index"]
-                else:
-                    dxbc_name = ""
-                    dxbc_slot = -1
+                # 优先使用 resource_id -> dxbc_name 映射
+                dxbc_name = ""
+                dxbc_slot = -1
+                
+                if res_id in resource_id_to_dxbc_name:
+                    dxbc_name = resource_id_to_dxbc_name[res_id]
+                    # 反向查找 slot
+                    for slot_idx, name in dxbc_texture_map.items():
+                        if name == dxbc_name:
+                            dxbc_slot = slot_idx
+                            break
+                    messages.debug(f"资源 {res_id} 通过 PSSetShaderResources 映射到 {dxbc_name} (t{dxbc_slot})")
                 
                 tex_file = export_texture(
-                    resources_accessor, res, call, input_dir, res_id, dxbc_name=dxbc_name
+                    resources_accessor, res, call, input_dir, res_id_str, dxbc_name=dxbc_name
                 )
                 if tex_file:
                     event_data["exported_textures"].append({
                         "type": "input",
-                        "resource_id": res_id,
+                        "resource_id": res_id_str,
                         "dxbc_name": dxbc_name,
                         "dxbc_slot": f"t{dxbc_slot}" if dxbc_slot >= 0 else "",
                         "order_index": idx,

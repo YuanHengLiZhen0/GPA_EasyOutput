@@ -1,7 +1,7 @@
 # Intel GPA Easy Output 插件文档
 
 **创建日期**: 2024年12月27日  
-**更新日期**: 2024年12月27日  
+**更新日期**: 2024年12月28日  
 **插件路径**: `%USERPROFILE%\Documents\GPA\python_plugins\easy_output`
 
 ---
@@ -270,6 +270,47 @@ DDS 文件结构：
 3. DDS_HEADER_DXT10 (20 bytes) - 用于 BC6H/BC7 等格式
 4. Pixel Data
 
+### 纹理名称映射（PSSetShaderResources）
+
+插件通过解析 `PSSetShaderResources` API 调用来精确映射纹理资源与 Shader 中的变量名。
+
+#### 工作流程
+
+```
+1. 解析 PS DXBC，获取纹理绑定信息：
+   ├── t0 → "tBaseMap"
+   ├── t1 → "tMixMap"
+   ├── t3 → "tNormalMap"
+   └── t6 → "tEmissionMap"
+
+2. 查找 DrawCall 之前的 PSSetShaderResources 调用：
+   PSSetShaderResources(StartSlot=0, NumViews=31, ppShaderResourceViews=[
+       {value: 989},   → slot 0
+       {value: 1466},  → slot 1
+       {value: 0},     → slot 2 (null)
+       {value: 1467},  → slot 3
+       ...
+   ])
+
+3. 建立 resource_id → dxbc_name 映射：
+   ├── 989  → "tBaseMap"   (slot 0)
+   ├── 1466 → "tMixMap"    (slot 1)
+   └── 1467 → "tNormalMap" (slot 3)
+
+4. 导出纹理时使用 dxbc_name 命名：
+   t_tBaseMap_3DD.dds
+   t_tMixMap_5BA.dds
+   t_tNormalMap_5BB.dds
+```
+
+#### 相关函数
+
+| 函数 | 说明 |
+|------|------|
+| `find_ps_set_shader_resources_before_event()` | 查找 DrawCall 之前的 PSSetShaderResources 调用 |
+| `build_resource_id_to_slot_map()` | 从 ppShaderResourceViews 建立 resource_id → slot 映射 |
+| `build_resource_id_to_dxbc_name_map()` | 结合 DXBC 解析结果，建立 resource_id → name 映射 |
+
 ---
 
 ## 插件描述信息
@@ -296,6 +337,15 @@ def desc():
 ---
 
 ## 更新日志
+
+### 2024-12-28 v2.0
+
+- **纹理名称精确映射**：通过解析 `PSSetShaderResources` 调用的 `ppShaderResourceViews` 参数，结合 DXBC 的纹理绑定信息，精确映射每个纹理资源到 Shader 中的变量名
+- 新增函数：
+  - `find_ps_set_shader_resources_before_event()` - 查找 DrawCall 之前的 PSSetShaderResources 调用
+  - `build_resource_id_to_slot_map()` - 从 ppShaderResourceViews 建立 resource_id → slot 映射
+  - `build_resource_id_to_dxbc_name_map()` - 建立 resource_id → dxbc_name 映射
+- 纹理文件命名更准确，如 `t_tBaseMap_3DD.dds` 而非按顺序匹配
 
 ### 2024-12-27 v1.9
 
