@@ -32,12 +32,8 @@ Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Ana
 
 1. 打开 Intel GPA Frame Analyzer
 2. 加载帧捕获文件
-3. 进入 **Plugins** 面板
-4. 选择 **"Easy Output - 资源导出工具"**
-5. 设置参数：
-   - `min_call`: 起始事件索引（包含），默认 0
-   - `max_call`: 结束事件索引（包含），-1 表示无上限
-6. 点击 **Run**
+3. 在api_log 上方的条形框中输入=easy_output(0,-1,0)
+4. 回车运行
 
 ---
 
