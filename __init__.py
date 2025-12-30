@@ -89,7 +89,65 @@ DXGI_FORMAT = {
 import plugin_api
 import plugin_adapter_interface
 from plugin_api.resources import ImageRequest, BufferRequest
-from logs import messages
+from logs import messages as _original_messages
+
+
+class UTF8Messages:
+    """
+    包装 messages 对象，确保日志使用 UTF-8 编码写入
+    同时写入到独立的 easy_output.log 文件
+    """
+    def __init__(self, original_messages):
+        self._original = original_messages
+        self._log_file = None
+        self._log_path = None
+    
+    def _get_log_file(self):
+        """获取日志文件句柄，延迟初始化"""
+        if self._log_file is None:
+            try:
+                # 获取插件目录
+                plugin_dir = os.path.dirname(os.path.abspath(__file__))
+                self._log_path = os.path.join(plugin_dir, "easy_output.log")
+                self._log_file = open(self._log_path, 'a', encoding='utf-8')
+            except Exception:
+                pass
+        return self._log_file
+    
+    def _write_to_file(self, msg):
+        """写入到文件"""
+        try:
+            f = self._get_log_file()
+            if f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"{timestamp}: {msg}\n")
+                f.flush()
+        except Exception:
+            pass
+    
+    def debug(self, msg):
+        """调试日志 - 仅写入 UTF-8 文件，不调用原始方法避免乱码"""
+        self._write_to_file(f"[DEBUG] {msg}")
+    
+    def info(self, msg):
+        """信息日志 - 仅写入 UTF-8 文件"""
+        self._write_to_file(f"[INFO] {msg}")
+    
+    def warning(self, msg):
+        """警告日志 - 仅写入 UTF-8 文件"""
+        self._write_to_file(f"[WARNING] {msg}")
+    
+    def error(self, msg):
+        """错误日志 - 仅写入 UTF-8 文件"""
+        self._write_to_file(f"[ERROR] {msg}")
+    
+    def __getattr__(self, name):
+        """转发其他属性到原始对象"""
+        return getattr(self._original, name)
+
+
+# 使用 UTF-8 包装器替换 messages
+messages = UTF8Messages(_original_messages)
 
 
 def get_frame_name():
@@ -1725,30 +1783,7 @@ def export_shaders(program, output_dir, event_index):
                 })
             
         
-        # 导出 shader 描述信息
-        shader_info_file = os.path.join(output_dir, f"shader_info_{program_id_hex}.json")
-        with open(shader_info_file, 'w', encoding='utf-8') as f:
-            # 过滤掉二进制数据，只保留描述信息
-            info = {
-                "program_id": program_id,
-                "program_id_hex": program_id_hex,
-                "event_index": event_index,
-                "shaders": {}
-            }
-            for shader_type in ["vertex", "pixel", "geometry", "hull", "domain", "compute"]:
-                if shader_type in program_desc:
-                    shader_info = program_desc[shader_type]
-                    info["shaders"][shader_type] = {
-                        "hash": shader_info.get("hash", ""),
-                        "has_source": bool(shader_info.get("source", "")),
-                        "has_dxil": bool(shader_info.get("dxil", ""))
-                    }
-            json.dump(info, f, indent=2, ensure_ascii=False, default=str)
-        
-        exported_shaders.append({
-            "type": "info",
-            "file": os.path.basename(shader_info_file)
-        })
+        # shader_info 文件已取消输出，shader 信息在 vs/ps dxbc 文件中包含
         
     except Exception as e:
         messages.debug(f"导出 shader 失败 (event {event_index}): {str(e)}")
@@ -1756,7 +1791,7 @@ def export_shaders(program, output_dir, event_index):
     return exported_shaders
 
 
-def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, call, output_dir, event_index, call_desc, skeleton_data=None, cbv_resources=None, enable_skinning=True, skeleton_resource_id=-1, skeleton_view_id=0):
+def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, call, output_dir, event_index, call_desc, skeleton_data=None, cbv_resources=None, enable_skinning=True, skeleton_cbv_info=None):
     """
     使用 IBV (Index Buffer View) 和 VBV (Vertex Buffer View) 资源生成 mesh
     支持蒙皮计算 (当提供骨骼数据且 enable_skinning=True 时)
@@ -1770,8 +1805,7 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
         call_desc: 调用描述
         skeleton_data: 骨骼矩阵数据 (float4 数组)，可选
         cbv_resources: CBV 类型的缓冲区资源列表，用于提取骨骼数据
-        skeleton_resource_id: 骨骼数据缓冲区的resource_id（-1表示自动检测size=768）
-        skeleton_view_id: 骨骼数据缓冲区的view_id（需与resource_id同时匹配）
+        skeleton_cbv_info: 骨骼数据的CBV信息 {"resource_id": int, "view_id": int}，从cbv_bindings中获取
     """
     try:
         if not ibv_resource or not vbv_resources:
@@ -1910,8 +1944,11 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
             if skeleton_data is None and cbv_resources:
                 target_cbv = None
                 
-                if skeleton_resource_id >= 0:
-                    # 使用指定的 resource_id 和 view_id 同时匹配
+                if skeleton_cbv_info:
+                    # 使用 cbv_bindings 中的 Skeleton 信息匹配
+                    skeleton_resource_id = skeleton_cbv_info.get("resource_id", -1)
+                    skeleton_view_id = skeleton_cbv_info.get("view_id", -1)
+                    
                     for cbv in cbv_resources:
                         cbv_desc = cbv.get_description()
                         cbv_res_id = cbv_desc.get("resource_id", -1)
@@ -1919,22 +1956,13 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
                         
                         if cbv_res_id == skeleton_resource_id and cbv_view_id == skeleton_view_id:
                             target_cbv = cbv
-                            messages.debug(f"找到骨骼数据 CBV: resource_id={skeleton_resource_id}, view_id={skeleton_view_id}")
+                            messages.debug(f"找到骨骼数据 CBV (Skeleton): resource_id={skeleton_resource_id}, view_id={skeleton_view_id}")
                             break
                     
                     if target_cbv is None:
                         messages.debug(f"警告: 未找到匹配的骨骼数据 CBV (resource_id={skeleton_resource_id}, view_id={skeleton_view_id})")
                 else:
-                    # 自动检测: 查找 size == 768 的 CBV（兼容旧逻辑）
-                    for cbv in cbv_resources:
-                        cbv_desc = cbv.get_description()
-                        cbv_size = cbv_desc.get("size", 0)
-                        if cbv_size == 768:
-                            target_cbv = cbv
-                            cbv_res_id = cbv_desc.get("resource_id", -1)
-                            cbv_view_id = cbv_desc.get("view_id", -1)
-                            messages.debug(f"自动检测到骨骼数据 CBV: size=768, resource_id={cbv_res_id}, view_id={cbv_view_id}")
-                            break
+                    messages.debug("警告: 未提供 skeleton_cbv_info，无法定位骨骼数据")
                 
                 # 提取骨骼数据
                 if target_cbv:
@@ -2206,11 +2234,184 @@ def build_resource_id_to_dxbc_name_map(resource_id_to_slot, dxbc_texture_map):
     return resource_id_to_name
 
 
+def parse_cbuffer_bindings_from_dxbc(dxbc_source):
+    """
+    从 DXBC 反汇编文本中解析 Resource Bindings，
+    提取 type 为 cbuffer 的内容
+    
+    解析格式:
+    // Name                                 Type  Format         Dim      HLSL Bind  Count
+    // ------------------------------ ---------- ------- ----------- -------------- ------
+    // cbPerFrame                         cbuffer      NA          NA            cb0      1
+    
+    返回:
+        [{"name": "cbPerFrame", "slot": "cb0", "slot_index": 0}]
+    """
+    import re
+    
+    cbuffers = []
+    
+    if not dxbc_source:
+        return cbuffers
+    
+    # 确保是字符串
+    if isinstance(dxbc_source, bytes):
+        try:
+            dxbc_source = dxbc_source.decode('utf-8', errors='ignore')
+        except:
+            dxbc_source = dxbc_source.decode('latin-1', errors='ignore')
+    
+    # 逐行解析
+    in_bindings_section = False
+    header_found = False
+    
+    lines = dxbc_source.split('\n')
+    for line_num, line in enumerate(lines):
+        line = line.strip()
+        
+        # 检测 Resource Bindings 部分开始
+        if "Resource Bindings:" in line:
+            in_bindings_section = True
+            continue
+        
+        # 检测表头行
+        if in_bindings_section and "Name" in line and "HLSL Bind" in line:
+            header_found = True
+            continue
+        
+        # 检测分隔线（跳过）
+        if in_bindings_section and "// ---" in line:
+            continue
+        
+        # 检测绑定部分结束
+        if in_bindings_section and header_found:
+            if not line or (not line.startswith("//")):
+                in_bindings_section = False
+                continue
+            
+            if line == "//":
+                in_bindings_section = False
+                continue
+            
+            # 解析资源绑定行
+            if line.startswith("//"):
+                content = line[2:].strip()
+                
+                # 使用正则匹配: Name Type Format Dim Bind Count
+                match = re.match(r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)', content)
+                if match:
+                    name, res_type, fmt, dim, bind, count = match.groups()
+                    
+                    # 只提取 cbuffer 类型
+                    if res_type == "cbuffer":
+                        try:
+                            # "cb0" -> 0
+                            slot_index = int(bind[2:]) if bind.startswith("cb") else -1
+                            cbuffer_info = {
+                                "name": name,
+                                "slot": bind,
+                                "slot_index": slot_index
+                            }
+                            cbuffers.append(cbuffer_info)
+                            messages.debug(f"[DXBC 解析] 找到 cbuffer {name} -> {bind}")
+                        except ValueError:
+                            pass
+    
+    return cbuffers
+
+
+def find_vs_set_constant_buffers_before_event(all_calls, target_call):
+    """
+    查找目标event之前、上一个event之后的所有VSSetConstantBuffers调用
+    
+    参数:
+        all_calls: 所有calls列表
+        target_call: 目标event的call对象
+    
+    返回:
+        VSSetConstantBuffers调用列表
+    """
+    vs_set_cb_calls = []
+    
+    # 找到target_call在all_calls中的位置
+    target_idx = -1
+    for i, c in enumerate(all_calls):
+        if c == target_call:
+            target_idx = i
+            break
+    
+    if target_idx <= 0:
+        messages.debug(f"未找到目标 event 在 all_calls 中的位置")
+        return vs_set_cb_calls
+    
+    # 从target_call往前遍历，直到遇到上一个event
+    for i in range(target_idx - 1, -1, -1):
+        c = all_calls[i]
+        desc = c.get_description()
+        name = desc.get('name', '')
+        
+        if desc.get('is_event', False):
+            # 遇到上一个event，停止
+            break
+        
+        if name.startswith('VSSetConstantBuffers'):
+            vs_set_cb_calls.insert(0, c)  # 保持顺序
+    
+    if not vs_set_cb_calls:
+        messages.debug(f"未找到 VSSetConstantBuffers 调用（event index: {target_idx}）")
+    
+    return vs_set_cb_calls
+
+
+def build_cbv_slot_bindings(vs_set_cb_calls):
+    """
+    从VSSetConstantBuffers调用中提取ppConstantBuffers，
+    建立 slot 绑定列表（按顺序记录）
+    
+    注意: ppConstantBuffers 中的值是 resource_id
+    每个 VSSetConstantBuffers 调用的每个条目只对应一个 slot
+    
+    参数:
+        vs_set_cb_calls: VSSetConstantBuffers调用列表
+    
+    返回:
+        list: [{"slot_index": int, "resource_id": int}, ...]
+    """
+    slot_bindings = []
+    
+    for call in vs_set_cb_calls:
+        desc = call.get_description()
+        arguments = desc.get('arguments', [])
+        
+        # 获取 StartSlot 参数
+        start_slot = 0
+        for arg in arguments:
+            if arg.get('name') == 'StartSlot':
+                start_slot = arg.get('value', 0)
+                break
+        
+        # 获取 ppConstantBuffers 参数（值是 resource_id）
+        for arg in arguments:
+            if arg.get('name') == 'ppConstantBuffers':
+                buffers = arg.get('value', [])
+                if isinstance(buffers, list):
+                    for idx, buf in enumerate(buffers):
+                        if isinstance(buf, dict):
+                            resource_id = buf.get('value', 0)
+                            if resource_id and resource_id != 0:
+                                slot_index = start_slot + idx
+                                slot_bindings.append({
+                                    "slot_index": slot_index,
+                                    "resource_id": resource_id
+                                })
+                break
+    
+    return slot_bindings
+
+
 def run(min_call: "起始事件索引（包含，从1开始）" = 1,
         max_call: "结束事件索引（包含），-1 表示无上限" = -1,
-        enable_skinning: "蒙皮计算开关（0=关闭，1=开启）" = 0,
-        skeleton_resource_id: "骨骼数据缓冲区的resource_id（-1表示自动检测size=768）" = -1,
-        skeleton_view_id: "骨骼数据缓冲区的view_id（默认0）" = 0):
+        enable_skinning: "蒙皮计算开关（0=关闭，1=开启）" = 0):
     """
     获取指定索引范围内的事件，导出所有纹理和缓冲区资源
     每个 event 的资源保存在以该 event ID 命名的文件夹下
@@ -2219,9 +2420,15 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
         min_call: 起始事件索引（包含，从1开始）
         max_call: 结束事件索引（包含），-1 表示无上限
         enable_skinning: 蒙皮计算开关（0=关闭，1=开启，默认 0）
-        skeleton_resource_id: 骨骼数据缓冲区的resource_id（-1表示自动检测size=768）
-        skeleton_view_id: 骨骼数据缓冲区的view_id（默认0，需与resource_id同时匹配）
+    
+    骨骼数据自动从 cbv_bindings 中 dxbc_name 为 "Skeleton" 的条目获取
     """
+    
+    # 输出函数调用日志
+    messages.info("=" * 60)
+    messages.info("easy_output 插件开始执行")
+    messages.info(f"函数: run(min_call={min_call}, max_call={max_call}, enable_skinning={enable_skinning})")
+    messages.info("=" * 60)
     
     api_log = plugin_api.get_api_log_accessor()
     resources_accessor = plugin_api.get_resources_accessor()
@@ -2290,18 +2497,12 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
         if not os.path.exists(event_dir):
             os.makedirs(event_dir)
         
-        # 创建 input 和 output 子文件夹
-        input_dir = os.path.join(event_dir, "input")
-        output_dir = os.path.join(event_dir, "output")
-        if not os.path.exists(input_dir):
-            os.makedirs(input_dir)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
         
         event_data = {
             "index": event_index,
             "id": call_id,
             "name": desc.get("name"),
+            "texture_binding_map": [],  # SRV resource_id -> dxbc_name 映射表
             "exported_textures": [],
             "exported_buffers": [],
             "exported_shaders": [],
@@ -2368,6 +2569,147 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                         
                         if resource_id_to_dxbc_name:
                             messages.debug(f"最终 resource_id->dxbc_name 映射: {resource_id_to_dxbc_name}")
+                            
+                            # 将映射关系输出到 JSON，包含 slot 信息
+                            for res_id, dxbc_name in resource_id_to_dxbc_name.items():
+                                slot = resource_id_to_slot.get(res_id, -1)
+                                event_data["texture_binding_map"].append({
+                                    "resource_id": res_id,
+                                    "resource_id_hex": f"{res_id:X}",
+                                    "slot": f"t{slot}" if slot >= 0 else "",
+                                    "slot_index": slot,
+                                    "dxbc_name": dxbc_name
+                                })
+            
+            # ============ 解析 VS DXBC cbuffer 绑定，建立 slot -> name 映射 ============
+            dxbc_cbuffer_map = {}  # slot_index -> name 映射 (如 0 -> "cbPerFrame")
+            cbv_resource_id_to_dxbc_name = {}
+            
+            if "execution" in bindings and "program" in bindings["execution"]:
+                program = bindings["execution"]["program"]
+                program_desc = program.get_description()
+                
+                # 解析 VS DXBC
+                if "vertex" in program_desc:
+                    vs_info = program_desc["vertex"]
+                    vs_dxbc = vs_info.get("dxbc", "")
+                    
+                    if vs_dxbc:
+                        # 解析 DXBC 中的 cbuffer 绑定
+                        dxbc_cbuffers = parse_cbuffer_bindings_from_dxbc(vs_dxbc)
+                        
+                        # 建立 slot_index -> name 映射
+                        for cb in dxbc_cbuffers:
+                            slot_index = cb.get("slot_index", -1)
+                            name = cb.get("name", "")
+                            if slot_index >= 0 and name:
+                                dxbc_cbuffer_map[slot_index] = name
+                        
+                        if dxbc_cbuffer_map:
+                            messages.debug(f"VS DXBC cbuffer slot->name 映射: {dxbc_cbuffer_map}")
+            
+            # ============ 从 VSSetConstantBuffers 建立 CBV 绑定映射 ============
+            cbv_bindings = []  # 初始化 cbv_bindings
+            skeleton_cbv_info = None  # 骨骼数据 CBV 信息
+            
+            if dxbc_cbuffer_map:
+                # 查找该 event 之前的 VSSetConstantBuffers 调用
+                vs_set_cb_calls = find_vs_set_constant_buffers_before_event(all_calls, call)
+                
+                if vs_set_cb_calls:
+                    # 从 VSSetConstantBuffers 提取 slot 绑定列表（resource_id -> slot）
+                    slot_bindings = build_cbv_slot_bindings(vs_set_cb_calls)
+                    
+                    if slot_bindings:
+                        messages.debug(f"VSSetConstantBuffers slot绑定: {slot_bindings}")
+                        
+                        # 从 inputs 中收集 CBV 资源的详细信息
+                        # 建立 resource_id -> list of CBV details 映射（按顺序）
+                        cbv_by_resource_id = {}
+                        if "inputs" in bindings:
+                            for res in bindings["inputs"]:
+                                res_desc = res.get_description()
+                                if res_desc.get("view_type") == "CBV":
+                                    res_id = res_desc.get("resource_id")
+                                    view_id = res_desc.get("view_id", 0)
+                                    
+                                    cbv_detail = {
+                                        "view_id": view_id,
+                                        "offset": res_desc.get("offset", 0),
+                                        "stride": res_desc.get("stride", 0),
+                                        "size": res_desc.get("size", 0),
+                                        "resource_type": res_desc.get("resource_type", "buffer")
+                                    }
+                                    
+                                    if res_id not in cbv_by_resource_id:
+                                        cbv_by_resource_id[res_id] = []
+                                    cbv_by_resource_id[res_id].append(cbv_detail)
+                        
+                        messages.debug(f"CBV resource_id->详情列表: {cbv_by_resource_id}")
+                        
+                        # 构建最终的 cbv_bindings 列表
+                        # 每个 slot 对应一个条目，通过 resource_id 匹配 CBV 详情（按顺序消耗）
+                        cbv_bindings = []
+                        resource_id_consumed_index = {}  # 记录每个 resource_id 已消耗的 view 索引
+                        
+                        for binding in slot_bindings:
+                            slot_index = binding["slot_index"]
+                            resource_id = binding["resource_id"]
+                            dxbc_name = dxbc_cbuffer_map.get(slot_index, "")
+                            
+                            # 通过 resource_id 获取 CBV 详情列表，按顺序取下一个
+                            cbv_list = cbv_by_resource_id.get(resource_id, [])
+                            consumed_idx = resource_id_consumed_index.get(resource_id, 0)
+                            
+                            if consumed_idx < len(cbv_list):
+                                cbv_detail = cbv_list[consumed_idx]
+                                resource_id_consumed_index[resource_id] = consumed_idx + 1
+                            else:
+                                cbv_detail = {}
+                            
+                            view_id = cbv_detail.get("view_id", 0)
+                            binding_info = {
+                                "slot": f"cb{slot_index}",
+                                "slot_index": slot_index,
+                                "dxbc_name": dxbc_name,
+                                "resource_id": resource_id,
+                                "resource_id_hex": f"{resource_id:X}" if resource_id else "",
+                                "view_id": view_id,
+                                "view_id_hex": f"{view_id:X}" if view_id else "",
+                                "offset": cbv_detail.get("offset", 0),
+                                "stride": cbv_detail.get("stride", 0),
+                                "size": cbv_detail.get("size", 0),
+                                "resource_type": cbv_detail.get("resource_type", "buffer")
+                            }
+                            cbv_bindings.append(binding_info)
+                        
+                        # 获取 program_id 用于命名
+                        vs_program_id = vs_info.get("hash", "")
+                        if not vs_program_id:
+                            vs_program_id = program_desc.get("id", "unknown")
+                        vs_program_id_hex = f"{vs_program_id:X}" if isinstance(vs_program_id, int) else str(vs_program_id)
+                        
+                        # 保存到单独的 vs_cbv_bindings_{program_id_hex}.json 文件
+                        vs_cbv_json_file = os.path.join(event_dir, f"vs_cbv_bindings_{vs_program_id_hex}.json")
+                        vs_cbv_data = {
+                            "program_id": vs_program_id,
+                            "program_id_hex": vs_program_id_hex,
+                            "dxbc_cbuffer_map": dxbc_cbuffer_map,
+                            "cbv_bindings": cbv_bindings
+                        }
+                        with open(vs_cbv_json_file, 'w', encoding='utf-8') as f:
+                            json.dump(vs_cbv_data, f, indent=2, ensure_ascii=False)
+                        messages.debug(f"VS CBV 绑定映射已保存到: {vs_cbv_json_file}")
+                        
+                        # 从 cbv_bindings 中查找 dxbc_name 为 "Skeleton" 的条目
+                        for binding in cbv_bindings:
+                            if binding.get("dxbc_name") == "Skeleton":
+                                skeleton_cbv_info = {
+                                    "resource_id": binding.get("resource_id"),
+                                    "view_id": binding.get("view_id")
+                                }
+                                messages.debug(f"找到 Skeleton CBV: resource_id={skeleton_cbv_info['resource_id']}, view_id={skeleton_cbv_info['view_id']}")
+                                break
             
             # 收集 inputs 中的资源
             srv_textures_view0 = []
@@ -2406,7 +2748,7 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                     messages.debug(f"资源 {res_id} 通过 PSSetShaderResources 映射到 {dxbc_name} (t{dxbc_slot})")
                 
                 tex_file = export_texture(
-                    resources_accessor, res, call, input_dir, res_id_str, dxbc_name=dxbc_name
+                    resources_accessor, res, call, event_dir, res_id_str, dxbc_name=dxbc_name
                 )
                 if tex_file:
                     event_data["exported_textures"].append({
@@ -2415,7 +2757,7 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                         "dxbc_name": dxbc_name,
                         "dxbc_slot": f"t{dxbc_slot}" if dxbc_slot >= 0 else "",
                         "order_index": idx,
-                        "file": f"input/{os.path.basename(tex_file)}"
+                        "file": os.path.basename(tex_file)
                     })
                     total_textures += 1
             
@@ -2429,13 +2771,13 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                 if resource_type == "texture":
                     # 非 SRV 的纹理资源
                     tex_file = export_texture(
-                        resources_accessor, res, call, input_dir, res_id
+                        resources_accessor, res, call, event_dir, res_id
                     )
                     if tex_file:
                         event_data["exported_textures"].append({
                             "type": "input",
                             "resource_id": res_id,
-                            "file": f"input/{os.path.basename(tex_file)}"
+                            "file": os.path.basename(tex_file)
                         })
                         total_textures += 1
                 
@@ -2445,50 +2787,62 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                         ibv_resource = res
                     elif view_type == "VBV":
                         vbv_resources.append(res)
+                        # VBV 不单独导出文件，稍后合并输出到 vbv.json
+                        continue
                     elif view_type == "CBV":
                         cbv_resources.append(res)
+                        # CBV 不单独导出文件，信息已在 vs_cbv_bindings 中输出
+                        continue
                     
                     buf_file = export_buffer(
-                        resources_accessor, res, call, input_dir, res_id
+                        resources_accessor, res, call, event_dir, res_id
                     )
                     if buf_file:
                         event_data["exported_buffers"].append({
                             "type": "input",
                             "resource_id": res_id,
-                            "file": f"input/{os.path.basename(buf_file)}"
+                            "file": os.path.basename(buf_file)
                         })
                         total_buffers += 1
             
-            # 处理 outputs 资源
-            if "outputs" in bindings:
-                for res in bindings["outputs"]:
-                    res_desc = res.get_description()
-                    res_id = str(res_desc.get("resource_id"))
-                    resource_type = res_desc.get("resource_type")
+            # 合并输出 VBV 信息到 vbv.json
+            if vbv_resources:
+                vbv_data = {"vbv_buffers": []}
+                for vbv_res in vbv_resources:
+                    vbv_desc = vbv_res.get_description()
+                    vbv_res_id = vbv_desc.get("resource_id", 0)
+                    vbv_stride = vbv_desc.get("stride", 0)
                     
-                    if resource_type == "texture":
-                        tex_file = export_texture(
-                            resources_accessor, res, call, output_dir, res_id
-                        )
-                        if tex_file:
-                            event_data["exported_textures"].append({
-                                "type": "output",
-                                "resource_id": res_id,
-                                "file": f"output/{os.path.basename(tex_file)}"
-                            })
-                            total_textures += 1
+                    # 根据 stride 确定类型名称
+                    if vbv_stride == 8:
+                        vbv_type = "bone"
+                    elif vbv_stride == 16:
+                        vbv_type = "tangent"
+                    else:
+                        vbv_type = "vertex"
                     
-                    elif resource_type == "buffer":
-                        buf_file = export_buffer(
-                            resources_accessor, res, call, output_dir, res_id
-                        )
-                        if buf_file:
-                            event_data["exported_buffers"].append({
-                                "type": "output",
-                                "resource_id": res_id,
-                                "file": f"output/{os.path.basename(buf_file)}"
-                            })
-                            total_buffers += 1
+                    vbv_info = {
+                        "type": vbv_type,
+                        "resource_id": vbv_res_id,
+                        "resource_id_hex": f"{vbv_res_id:X}",
+                        "view_id": vbv_desc.get("view_id", 0),
+                        "view_type": vbv_desc.get("view_type", "VBV"),
+                        "size": vbv_desc.get("size", 0),
+                        "stride": vbv_stride,
+                        "offset": vbv_desc.get("offset", 0),
+                        "resource_type": vbv_desc.get("resource_type", "buffer")
+                    }
+                    vbv_data["vbv_buffers"].append(vbv_info)
+                
+                vbv_json_file = os.path.join(event_dir, "vbv.json")
+                with open(vbv_json_file, 'w', encoding='utf-8') as f:
+                    json.dump(vbv_data, f, indent=2, ensure_ascii=False)
+                
+                event_data["exported_buffers"].append({
+                    "type": "input",
+                    "resource_id": "vbv_combined",
+                    "file": "vbv.json"
+                })
             
             # 导出 Mesh（放在 input 文件夹中，因为是输入几何体）
             # 支持蒙皮计算：传入 CBV 资源用于提取骨骼矩阵数据
@@ -2497,33 +2851,32 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
             # 优先使用收集的 IBV 和 VBV 资源生成 mesh（支持蒙皮）
             if ibv_resource and vbv_resources:
                 obj_file = export_mesh_from_buffers(
-                    resources_accessor, ibv_resource, vbv_resources, call, input_dir, event_index, desc,
+                    resources_accessor, ibv_resource, vbv_resources, call, event_dir, event_index, desc,
                     skeleton_data=None,  # 让函数自动从 CBV 提取
                     cbv_resources=cbv_resources,
                     enable_skinning=(enable_skinning == 1),  # 0=关闭，1=开启
-                    skeleton_resource_id=skeleton_resource_id,
-                    skeleton_view_id=skeleton_view_id
+                    skeleton_cbv_info=skeleton_cbv_info  # 从 cbv_bindings 中获取的 Skeleton 信息
                 )
             
             # 如果 IBV/VBV 方式失败，尝试使用 geometry_info
             if not obj_file and "metadata" in bindings and "input_geometry" in bindings["metadata"]:
                 geometry_info = bindings["metadata"]["input_geometry"]
                 obj_file = export_mesh_to_obj(
-                    resources_accessor, call, geometry_info, input_dir, event_index, desc
+                    resources_accessor, call, geometry_info, event_dir, event_index, desc
                 )
             
             if obj_file:
-                event_data["exported_mesh"] = f"input/{os.path.basename(obj_file)}"
+                event_data["exported_mesh"] = os.path.basename(obj_file)
                 total_meshes += 1
             
             # 导出 Shader（放在 input 文件夹中）
             if "execution" in bindings and "program" in bindings["execution"]:
                 program = bindings["execution"]["program"]
-                exported_shaders = export_shaders(program, input_dir, event_index)
+                exported_shaders = export_shaders(program, event_dir, event_index)
                 for shader in exported_shaders:
                     event_data["exported_shaders"].append({
                         "type": shader["type"],
-                        "file": f"input/{shader['file']}"
+                        "file": shader['file']
                     })
                 if exported_shaders:
                     total_shaders += 1
