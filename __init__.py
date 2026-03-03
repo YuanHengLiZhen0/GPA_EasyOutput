@@ -1137,6 +1137,82 @@ def get_draw_call_params(call_desc):
     return index_count, start_index_location, base_vertex_location
 
 
+def parse_indirect_args_buffer(buffer_data):
+    """
+    解析 DrawIndexedInstancedIndirect 的 args buffer
+    
+    Buffer 结构 (20 bytes):
+        uint IndexCountPerInstance;    // offset 0,  4 bytes
+        uint InstanceCount;            // offset 4,  4 bytes
+        uint StartIndexLocation;       // offset 8,  4 bytes
+        int  BaseVertexLocation;       // offset 12, 4 bytes (signed)
+        uint StartInstanceLocation;    // offset 16, 4 bytes
+    
+    返回: dict 包含解析后的参数，失败时返回 None
+    """
+    try:
+        data_bytes = bytes(buffer_data)
+        
+        if len(data_bytes) < 20:
+            messages.debug(f"Indirect args buffer 数据不足: {len(data_bytes)} bytes, 需要 20 bytes")
+            return None
+        
+        # 解析 5 个 uint/int 值
+        index_count_per_instance = struct.unpack_from('<I', data_bytes, 0)[0]
+        instance_count = struct.unpack_from('<I', data_bytes, 4)[0]
+        start_index_location = struct.unpack_from('<I', data_bytes, 8)[0]
+        base_vertex_location = struct.unpack_from('<i', data_bytes, 12)[0]  # signed int
+        start_instance_location = struct.unpack_from('<I', data_bytes, 16)[0]
+        
+        indirect_args = {
+            "IndexCountPerInstance": index_count_per_instance,
+            "InstanceCount": instance_count,
+            "StartIndexLocation": start_index_location,
+            "BaseVertexLocation": base_vertex_location,
+            "StartInstanceLocation": start_instance_location
+        }
+        
+        messages.debug(f"解析 Indirect Args: IndexCount={index_count_per_instance}, "
+                      f"InstanceCount={instance_count}, StartIndex={start_index_location}, "
+                      f"BaseVertex={base_vertex_location}, StartInstance={start_instance_location}")
+        
+        return indirect_args
+        
+    except Exception as e:
+        messages.debug(f"解析 Indirect args buffer 失败: {str(e)}")
+        return None
+
+
+def find_args_buffer_from_inputs(bindings):
+    """
+    从 bindings 的 inputs 中查找 view_type 为 "args" 的 buffer
+    
+    返回: 找到的资源对象，未找到返回 None
+    """
+    if "inputs" not in bindings:
+        return None
+    
+    for res in bindings["inputs"]:
+        res_desc = res.get_description()
+        view_type = res_desc.get("view_type", "")
+        resource_type = res_desc.get("resource_type", "")
+        
+        if view_type.lower() == "args" and resource_type == "buffer":
+            res_id = res_desc.get("resource_id", 0)
+            messages.debug(f"找到 args buffer: resource_id={res_id}, view_type={view_type}")
+            return res
+    
+    return None
+
+
+def is_draw_indexed_instanced_indirect(call_desc):
+    """
+    检查调用是否为 DrawIndexedInstancedIndirect
+    """
+    call_name = call_desc.get("name", "")
+    return "DrawIndexedInstancedIndirect" in call_name
+
+
 def decode_ubyte4_normal(nx, ny, nz):
     """
     将 ubyte4 法线保持原始值 (0-255)
@@ -1791,7 +1867,7 @@ def export_shaders(program, output_dir, event_index):
     return exported_shaders
 
 
-def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, call, output_dir, event_index, call_desc, skeleton_data=None, cbv_resources=None, enable_skinning=True, skeleton_cbv_info=None):
+def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, call, output_dir, event_index, call_desc, skeleton_data=None, cbv_resources=None, enable_skinning=True, skeleton_cbv_info=None, indirect_args=None):
     """
     使用 IBV (Index Buffer View) 和 VBV (Vertex Buffer View) 资源生成 mesh
     支持蒙皮计算 (当提供骨骼数据且 enable_skinning=True 时)
@@ -1806,13 +1882,23 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
         skeleton_data: 骨骼矩阵数据 (float4 数组)，可选
         cbv_resources: CBV 类型的缓冲区资源列表，用于提取骨骼数据
         skeleton_cbv_info: 骨骼数据的CBV信息 {"resource_id": int, "view_id": int}，从cbv_bindings中获取
+        indirect_args: DrawIndexedInstancedIndirect 的参数 (从 args buffer 解析)，可选
+                       包含: IndexCountPerInstance, InstanceCount, StartIndexLocation, 
+                             BaseVertexLocation, StartInstanceLocation
     """
     try:
         if not ibv_resource or not vbv_resources:
             return None
         
         # 获取绘制调用参数
-        index_count, start_index_location, base_vertex_location = get_draw_call_params(call_desc)
+        # 如果提供了 indirect_args，优先使用 indirect_args 中的参数
+        if indirect_args:
+            index_count = indirect_args.get("IndexCountPerInstance", 0)
+            start_index_location = indirect_args.get("StartIndexLocation", 0)
+            base_vertex_location = indirect_args.get("BaseVertexLocation", 0)
+            messages.debug(f"使用 Indirect Args: IndexCount={index_count}, StartIndex={start_index_location}, BaseVertex={base_vertex_location}")
+        else:
+            index_count, start_index_location, base_vertex_location = get_draw_call_params(call_desc)
         
         # ==================== 先读取索引数据，计算实际 vertex_count ====================
         ibv_request = BufferRequest(
@@ -2848,6 +2934,39 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
             # 支持蒙皮计算：传入 CBV 资源用于提取骨骼矩阵数据
             obj_file = None
             
+            # 检查是否为 DrawIndexedInstancedIndirect 调用
+            indirect_args = None
+            if is_draw_indexed_instanced_indirect(desc):
+                messages.debug(f"检测到 DrawIndexedInstancedIndirect 调用")
+                
+                # 查找 view_type 为 "args" 的 buffer
+                args_buffer = find_args_buffer_from_inputs(bindings)
+                
+                if args_buffer:
+                    # 读取 args buffer 数据
+                    try:
+                        args_request = BufferRequest(
+                            buffer=args_buffer,
+                            call=call,
+                            extract_before=False
+                        )
+                        args_result = resources_accessor.get_buffers_data([args_request], timeout=30000)
+                        
+                        if args_request in args_result:
+                            args_data = args_result[args_request].data
+                            indirect_args = parse_indirect_args_buffer(args_data)
+                            
+                            if indirect_args:
+                                # 将 indirect args 信息保存到 event_data
+                                event_data["indirect_args"] = indirect_args
+                                messages.debug(f"成功提取 Indirect Args: {indirect_args}")
+                        else:
+                            messages.debug("读取 args buffer 失败")
+                    except Exception as e:
+                        messages.debug(f"读取 args buffer 异常: {str(e)}")
+                else:
+                    messages.debug("未找到 view_type='args' 的 buffer")
+            
             # 优先使用收集的 IBV 和 VBV 资源生成 mesh（支持蒙皮）
             if ibv_resource and vbv_resources:
                 obj_file = export_mesh_from_buffers(
@@ -2855,7 +2974,8 @@ def run(min_call: "起始事件索引（包含，从1开始）" = 1,
                     skeleton_data=None,  # 让函数自动从 CBV 提取
                     cbv_resources=cbv_resources,
                     enable_skinning=(enable_skinning == 1),  # 0=关闭，1=开启
-                    skeleton_cbv_info=skeleton_cbv_info  # 从 cbv_bindings 中获取的 Skeleton 信息
+                    skeleton_cbv_info=skeleton_cbv_info,  # 从 cbv_bindings 中获取的 Skeleton 信息
+                    indirect_args=indirect_args  # DrawIndexedInstancedIndirect 的参数
                 )
             
             # 如果 IBV/VBV 方式失败，尝试使用 geometry_info

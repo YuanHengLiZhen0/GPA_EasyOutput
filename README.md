@@ -1,7 +1,7 @@
 # Intel GPA Easy Output 插件文档
 
 **创建日期**: 2024年12月27日  
-**更新日期**: 2024年12月30日  
+**更新日期**: 2026年3月3日  
 **插件路径**: `%USERPROFILE%\Documents\GPA\python_plugins\easy_output`
 
 ---
@@ -292,6 +292,42 @@ f 1/1/1 2/2/2 3/3/3
 3. 对顶点位置和法线应用骨骼矩阵变换
 4. 支持最多 4 骨骼混合权重
 
+#### DrawIndexedInstancedIndirect 支持
+
+对于 `DrawIndexedInstancedIndirect` 类型的绘制调用，插件会：
+
+1. 检测事件名称是否包含 `DrawIndexedInstancedIndirect`
+2. 查找 `inputs` 中 `view_type="args"` 的 buffer
+3. 从 args buffer 的前 20 字节解析间接参数：
+
+```c
+struct D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS {
+    uint IndexCountPerInstance;    // 每实例索引数量
+    uint InstanceCount;            // 实例数量
+    uint StartIndexLocation;       // 起始索引位置
+    int  BaseVertexLocation;       // 基础顶点偏移（有符号）
+    uint StartInstanceLocation;    // 起始实例位置
+};
+```
+
+4. 使用 `StartIndexLocation` 和 `IndexCountPerInstance` 确定索引范围
+5. 索引 buffer 范围：`[StartIndexLocation, StartIndexLocation + IndexCountPerInstance)`
+
+**输出示例**（在 `_event_info.json` 中）：
+
+```json
+{
+  "name": "DrawIndexedInstancedIndirect",
+  "indirect_args": {
+    "IndexCountPerInstance": 3456,
+    "InstanceCount": 1,
+    "StartIndexLocation": 0,
+    "BaseVertexLocation": 0,
+    "StartInstanceLocation": 0
+  }
+}
+```
+
 ---
 
 ## JSON 文件结构
@@ -381,8 +417,11 @@ bindings = call.get_bindings()
 | `find_vs_set_constant_buffers_before_event()` | 查找 VSSetConstantBuffers 调用 |
 | `build_resource_id_to_slot_map()` | 建立 resource_id → slot 映射 |
 | `build_cbv_slot_bindings()` | 建立 CBV slot 绑定列表 |
-| `export_mesh_from_buffers()` | 从 IBV/VBV 导出网格（支持蒙皮） |
+| `export_mesh_from_buffers()` | 从 IBV/VBV 导出网格（支持蒙皮和间接绘制） |
 | `apply_skinning()` | 应用骨骼蒙皮变换 |
+| `is_draw_indexed_instanced_indirect()` | 检测 DrawIndexedInstancedIndirect 调用 |
+| `find_args_buffer_from_inputs()` | 查找 view_type="args" 的 buffer |
+| `parse_indirect_args_buffer()` | 解析间接绘制参数结构体 |
 
 ---
 
@@ -402,6 +441,15 @@ bindings = call.get_bindings()
 ---
 
 ## 更新日志
+
+### 2026-03-03 v3.1
+
+- **DrawIndexedInstancedIndirect 支持**：
+  - 自动检测 `DrawIndexedInstancedIndirect` 类型的绘制调用
+  - 从 `view_type="args"` 的 buffer 中提取间接绘制参数
+  - 解析 20 字节的间接参数结构体（IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation）
+  - 使用 `StartIndexLocation` 和 `IndexCountPerInstance` 精确提取索引范围
+  - 在 `_event_info.json` 中输出 `indirect_args` 信息
 
 ### 2024-12-30 v3.0
 
