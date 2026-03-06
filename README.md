@@ -15,7 +15,7 @@ Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Ana
 - 缓冲区资源（VBV/IBV）
 - 着色器信息（DXBC/HLSL）
 - CBV 绑定映射（JSON）
-- 几何数据（OBJ，支持蒙皮）
+- 几何数据（OBJ，支持蒙皮 + 间接绘制）
 
 ---
 
@@ -60,11 +60,37 @@ Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Ana
 
 ---
 
+## 处理流程
+
+`run()` 函数将每个事件的导出拆分为 **10 个 Stage**，每个 Stage 由独立函数实现：
+
+```
+Stage 0   _stage_init_session          初始化会话（筛选事件、创建目录）
+            │
+            ▼  ── 逐事件循环 (_process_single_event) ──
+            │
+Stage 1   _stage_build_ps_texture_map  解析 PS DXBC + PSSetShaderResources 纹理绑定
+Stage 2   _stage_build_vs_cbv_map      解析 VS DXBC + VSSetConstantBuffers CBV 绑定
+Stage 3   _stage_classify_inputs       分类输入资源 (SRV 纹理 vs 其他)
+Stage 4   _stage_export_textures       导出 SRV 纹理 (DDS)
+Stage 5   _stage_export_other_inputs   导出其他输入 + 收集 IBV / VBV / CBV
+Stage 6   _stage_export_vbv            合并输出 VBV (vbv.json)
+Stage 7   _stage_extract_indirect_args 提取 Indirect Args (DrawIndexedInstancedIndirect)
+Stage 8   _stage_export_mesh           导出 Mesh (OBJ，支持蒙皮 + 间接绘制)
+Stage 9   _stage_export_event_shaders  导出 Shader (DXBC / HLSL)
+Stage 10  _stage_save_event_info       保存事件信息 (_event_info.json)
+            │
+            ▼  ── 循环结束 ──
+            │
+          _finalize_export             汇总统计并返回结果
+```
+
+---
+
 ## 输出结构
 
 ```
 easy_output/
-├── export_20241230_130000.json          # 主汇总文件
 ├── easy_output.log                       # 日志文件（UTF-8编码）
 └── resources/
     └── {frame_name}_{timestamp}/
@@ -95,41 +121,9 @@ easy_output/
 
 ## 核心功能
 
-### 1. 纹理导出（DDS）
+### Stage 1 — 纹理绑定映射 (PSSetShaderResources)
 
-所有纹理统一导出为 DDS 格式，使用 DXBC 中的变量名命名。
-
-#### 支持的纹理格式
-
-| 纹理格式 | DXGI 格式代码 |
-|----------|---------------|
-| `R8G8B8A8_*` | 28 |
-| `B8G8R8A8_*` | 87 |
-| `BC1` (DXT1) | 71 |
-| `BC2` (DXT3) | 74 |
-| `BC3` (DXT5) | 77 |
-| `BC4` | 80 |
-| `BC5` | 83 |
-| `BC6H` | 95 |
-| `BC7` | 98 |
-
-#### 文件命名
-
-```
-t_{dxbc_name}_{resource_id_hex}.dds
-```
-
-**示例**：
-```
-t_tBaseMap_3DD.dds     # tBaseMap 纹理，资源 ID 0x3DD
-t_tNormalMap_5BB.dds   # tNormalMap 纹理，资源 ID 0x5BB
-```
-
----
-
-### 2. 纹理名称映射（PSSetShaderResources）
-
-插件通过解析 `PSSetShaderResources` API 调用来精确映射纹理资源与 Shader 中的变量名。
+插件通过解析 DXBC 和 `PSSetShaderResources` API 调用来精确映射纹理资源与 Shader 变量名。
 
 #### 工作流程
 
@@ -159,9 +153,9 @@ t_tNormalMap_5BB.dds   # tNormalMap 纹理，资源 ID 0x5BB
 
 ---
 
-### 3. CBV 绑定映射（VSSetConstantBuffers）
+### Stage 2 — CBV 绑定映射 (VSSetConstantBuffers)
 
-插件解析 `VSSetConstantBuffers` 调用，结合 VS DXBC 的 cbuffer 绑定信息，建立完整的 CBV 映射。
+解析 `VSSetConstantBuffers` 调用，结合 VS DXBC 的 cbuffer 绑定信息，建立完整的 CBV 映射。
 
 #### 输出文件：`vs_cbv_bindings_{program_id_hex}.json`
 
@@ -208,7 +202,39 @@ t_tNormalMap_5BB.dds   # tNormalMap 纹理，资源 ID 0x5BB
 
 ---
 
-### 4. VBV 缓冲区信息
+### Stage 4 — 纹理导出 (DDS)
+
+所有纹理统一导出为 DDS 格式，使用 DXBC 中的变量名命名。
+
+#### 支持的纹理格式
+
+| 纹理格式 | DXGI 格式代码 |
+|----------|---------------|
+| `R8G8B8A8_*` | 28 |
+| `B8G8R8A8_*` | 87 |
+| `BC1` (DXT1) | 71 |
+| `BC2` (DXT3) | 74 |
+| `BC3` (DXT5) | 77 |
+| `BC4` | 80 |
+| `BC5` | 83 |
+| `BC6H` | 95 |
+| `BC7` | 98 |
+
+#### 文件命名
+
+```
+t_{dxbc_name}_{resource_id_hex}.dds
+```
+
+**示例**：
+```
+t_tBaseMap_3DD.dds     # tBaseMap 纹理，资源 ID 0x3DD
+t_tNormalMap_5BB.dds   # tNormalMap 纹理，资源 ID 0x5BB
+```
+
+---
+
+### Stage 6 — VBV 缓冲区信息
 
 所有 VBV（Vertex Buffer View）资源合并到单个文件：`vbv.json`
 
@@ -259,42 +285,9 @@ t_tNormalMap_5BB.dds   # tNormalMap 纹理，资源 ID 0x5BB
 
 ---
 
-### 5. 几何数据导出（OBJ）
+### Stage 7 — DrawIndexedInstancedIndirect 支持
 
-导出为 Wavefront OBJ 格式，支持蒙皮变换。
-
-```obj
-# Exported from Intel GPA - Call ID: g_51
-# Skinning Applied: Yes
-# Vertices: 4018, Indices: 21642
-
-v 0.500000 1.000000 0.000000
-v 0.400000 0.900000 0.100000
-...
-
-vn 0.577350 0.577350 0.577350
-vn 0.707107 0.707107 0.000000
-...
-
-vt 0.500000 0.750000
-vt 0.250000 0.500000
-...
-
-f 1/1/1 2/2/2 3/3/3
-...
-```
-
-#### 蒙皮计算
-
-当 `enable_skinning=1` 时：
-1. 自动从 `cbv_bindings` 中找到 `dxbc_name="Skeleton"` 的条目
-2. 使用对应的 `resource_id` 和 `view_id` 定位骨骼矩阵数据
-3. 对顶点位置和法线应用骨骼矩阵变换
-4. 支持最多 4 骨骼混合权重
-
-#### DrawIndexedInstancedIndirect 支持
-
-对于 `DrawIndexedInstancedIndirect` 类型的绘制调用，插件会：
+对于 `DrawIndexedInstancedIndirect` 类型的绘制调用：
 
 1. 检测事件名称是否包含 `DrawIndexedInstancedIndirect`
 2. 查找 `inputs` 中 `view_type="args"` 的 buffer
@@ -330,40 +323,42 @@ struct D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS {
 
 ---
 
-## JSON 文件结构
+### Stage 8 — 几何数据导出 (OBJ)
 
-### 主汇总文件 (`export_*.json`)
+导出为 Wavefront OBJ 格式，支持蒙皮变换和间接绘制。
 
-```json
-{
-  "export_time": "2024-12-30 13:00:00",
-  "filter": {
-    "min_call": 51,
-    "max_call": 52
-  },
-  "total_count": 2,
-  "events": [
-    {
-      "index": 51,
-      "id": "g_51",
-      "name": "DrawIndexedInstanced",
-      "texture_binding_map": [
-        {"resource_id": 989, "resource_id_hex": "3DD", "slot": "t0", "slot_index": 0, "dxbc_name": "tBaseMap"}
-      ],
-      "exported_textures": [...],
-      "exported_buffers": [...],
-      "exported_shaders": [...],
-      "exported_mesh": "g_51.obj"
-    }
-  ],
-  "summary": {
-    "total_events": 2,
-    "total_textures": 14,
-    "total_buffers": 4,
-    "total_meshes": 2
-  }
-}
+```obj
+# Exported from Intel GPA - Call ID: g_51
+# Skinning Applied: Yes
+# Vertices: 4018, Indices: 21642
+
+v 0.500000 1.000000 0.000000
+v 0.400000 0.900000 0.100000
+...
+
+vn 0.577350 0.577350 0.577350
+vn 0.707107 0.707107 0.000000
+...
+
+vt 0.500000 0.750000
+vt 0.250000 0.500000
+...
+
+f 1/1/1 2/2/2 3/3/3
+...
 ```
+
+#### 蒙皮计算
+
+当 `enable_skinning=1` 时：
+1. 自动从 `cbv_bindings` 中找到 `dxbc_name="Skeleton"` 的条目
+2. 使用对应的 `resource_id` 和 `view_id` 定位骨骼矩阵数据
+3. 对顶点位置和法线应用骨骼矩阵变换
+4. 支持最多 4 骨骼混合权重
+
+---
+
+## JSON 文件结构
 
 ### 事件信息文件 (`_event_info.json`)
 
@@ -372,14 +367,14 @@ struct D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS {
   "index": 51,
   "id": "g_51",
   "name": "DrawIndexedInstanced",
-  "texture_binding_map": [
-    {"resource_id": 989, "resource_id_hex": "3DD", "slot": "t0", "slot_index": 0, "dxbc_name": "tBaseMap"},
-    {"resource_id": 1466, "resource_id_hex": "5BA", "slot": "t1", "slot_index": 1, "dxbc_name": "tMixMap"}
-  ],
-  "exported_textures": [...],
-  "exported_buffers": [...],
-  "exported_shaders": [...],
-  "exported_mesh": "g_51.obj"
+  "arguments": [...],
+  "bindings_summary": {
+    "inputs_count": 12,
+    "outputs_count": 4,
+    "has_program": true,
+    "has_geometry": true,
+    "shaders_exported": 2
+  }
 }
 ```
 
@@ -393,21 +388,35 @@ struct D3D11_DRAW_INDEXED_INSTANCED_INDIRECT_ARGS {
 import plugin_api
 from plugin_api.resources import ImageRequest, BufferRequest
 
-# 获取访问器
 api_log = plugin_api.get_api_log_accessor()
 resources_accessor = plugin_api.get_resources_accessor()
 
-# 获取所有调用
 calls = api_log.get_calls()
-
-# 获取事件绑定
 bindings = call.get_bindings()
 # bindings["inputs"]  - 输入资源列表
 # bindings["outputs"] - 输出资源列表
 # bindings["execution"]["program"] - 着色器程序
 ```
 
-### 关键函数
+### Stage 函数一览
+
+| 函数 | Stage | 说明 |
+|------|-------|------|
+| `_stage_init_session()` | 0 | 初始化会话，筛选事件，创建目录 |
+| `_stage_build_ps_texture_map()` | 1 | 解析 PS DXBC + PSSetShaderResources 纹理绑定 |
+| `_stage_build_vs_cbv_map()` | 2 | 解析 VS DXBC + VSSetConstantBuffers CBV 绑定 |
+| `_stage_classify_inputs()` | 3 | 分类输入资源 (SRV 纹理 vs 其他) |
+| `_stage_export_textures()` | 4 | 导出 SRV 纹理 (DDS) |
+| `_stage_export_other_inputs()` | 5 | 导出其他输入，收集 IBV / VBV / CBV |
+| `_stage_export_vbv()` | 6 | 合并输出 VBV 信息 |
+| `_stage_extract_indirect_args()` | 7 | 提取 DrawIndexedInstancedIndirect 参数 |
+| `_stage_export_mesh()` | 8 | 导出网格 (OBJ，支持蒙皮 + 间接绘制) |
+| `_stage_export_event_shaders()` | 9 | 导出着色器 (DXBC / HLSL) |
+| `_stage_save_event_info()` | 10 | 保存 _event_info.json |
+| `_process_single_event()` | — | 串联 Stage 1~10 |
+| `_finalize_export()` | — | 汇总统计并返回结果 |
+
+### 辅助函数
 
 | 函数 | 说明 |
 |------|------|
@@ -417,11 +426,12 @@ bindings = call.get_bindings()
 | `find_vs_set_constant_buffers_before_event()` | 查找 VSSetConstantBuffers 调用 |
 | `build_resource_id_to_slot_map()` | 建立 resource_id → slot 映射 |
 | `build_cbv_slot_bindings()` | 建立 CBV slot 绑定列表 |
-| `export_mesh_from_buffers()` | 从 IBV/VBV 导出网格（支持蒙皮和间接绘制） |
+| `export_mesh_from_buffers()` | 从 IBV/VBV 导出网格（支持蒙皮 + 间接绘制） |
 | `apply_skinning()` | 应用骨骼蒙皮变换 |
 | `is_draw_indexed_instanced_indirect()` | 检测 DrawIndexedInstancedIndirect 调用 |
 | `find_args_buffer_from_inputs()` | 查找 view_type="args" 的 buffer |
 | `parse_indirect_args_buffer()` | 解析间接绘制参数结构体 |
+| `_get_program_desc()` | 从 bindings 安全获取 program description |
 
 ---
 
@@ -442,26 +452,26 @@ bindings = call.get_bindings()
 
 ## 更新日志
 
-### 2026-03-03 v3.1
+### 2026-03-03 v4.0
 
-- **DrawIndexedInstancedIndirect 支持**：
+- **代码架构重构**：将 ~560 行的单体 `run()` 函数拆分为 10 个独立 Stage 函数
+  - 每个 Stage 职责单一，命名清晰 (`_stage_*`)
+  - `_process_single_event()` 负责串联所有 Stage
+  - `_stage_init_session()` 返回 session 上下文字典
+  - `_finalize_export()` 统一汇总
+- **DrawIndexedInstancedIndirect 支持** (Stage 7):
   - 自动检测 `DrawIndexedInstancedIndirect` 类型的绘制调用
   - 从 `view_type="args"` 的 buffer 中提取间接绘制参数
-  - 解析 20 字节的间接参数结构体（IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation）
+  - 解析 20 字节的间接参数结构体
   - 使用 `StartIndexLocation` 和 `IndexCountPerInstance` 精确提取索引范围
   - 在 `_event_info.json` 中输出 `indirect_args` 信息
 
 ### 2024-12-30 v3.0
 
-- **骨骼数据自动识别**：移除 `skeleton_resource_id` 和 `skeleton_view_id` 参数，自动从 `cbv_bindings` 中查找 `dxbc_name="Skeleton"` 的条目
-- **CBV 绑定映射**：新增 `vs_cbv_bindings_{program_id_hex}.json` 文件，包含完整的 CBV 绑定信息
-  - 通过 `VSSetConstantBuffers` 解析 slot 绑定
-  - 包含 resource_id、view_id、offset、size 等详细信息
-- **VBV 信息合并**：所有 VBV 缓冲区信息合并到 `vbv.json`
-- **取消独立 CBV 文件**：CBV 信息已整合到 `vs_cbv_bindings` 中
-- **取消 input/output 子文件夹**：所有资源直接输出到事件文件夹
-- **取消 output 资源导出**：仅导出输入资源
-- **取消 shader_info 文件**：shader 信息在 dxbc 文件中
+- **骨骼数据自动识别**：自动从 `cbv_bindings` 中查找 `dxbc_name="Skeleton"`
+- **CBV 绑定映射**：`vs_cbv_bindings_{program_id_hex}.json`
+- **VBV 信息合并**：`vbv.json`
+- **取消独立 CBV / shader_info / input&output 子文件夹**
 - **日志 UTF-8 编码**：修复中文乱码问题
 
 ### 2024-12-28 v2.0
