@@ -1,19 +1,19 @@
 # Intel GPA Easy Output 插件文档
 
 **创建日期**: 2024年12月27日  
-**更新日期**: 2026年3月3日  
+**更新日期**: 2026年3月9日  
 **插件路径**: `%USERPROFILE%\Documents\GPA\python_plugins\easy_output`
 
 ---
 
 ## 概述
 
-Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Analyzer 的 Python 插件，用于批量导出帧分析数据，包括：
+Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Analyzer 的 Python 插件，**同时支持 DirectX 11 和 DirectX 12** 帧捕获，批量导出帧分析数据，包括：
 
 - API 调用信息（JSON）
 - 纹理资源（DDS）
 - 缓冲区资源（VBV/IBV）
-- 着色器信息（DXBC/HLSL）
+- 着色器信息（DXBC / DXIL / HLSL）
 - CBV 绑定映射（JSON）
 - 几何数据（OBJ，支持蒙皮 + 间接绘制）
 
@@ -48,6 +48,8 @@ Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Ana
 | `enable_skinning` | int | 0 | 蒙皮计算开关（0=关闭，1=开启） |
 
 > **注意**：骨骼数据自动从 `cbv_bindings` 中 `dxbc_name` 为 **"Skeleton"** 的条目获取，无需手动指定。
+> 
+> **API 自动检测**：插件自动检测帧捕获使用的是 DirectX 11 还是 DirectX 12，无需手动指定。
 
 ### 示例
 
@@ -65,19 +67,19 @@ Easy Output 是一个用于 Intel Graphics Performance Analyzers (GPA) Frame Ana
 `run()` 函数将每个事件的导出拆分为 **10 个 Stage**，每个 Stage 由独立函数实现：
 
 ```
-Stage 0   _stage_init_session          初始化会话（筛选事件、创建目录）
+Stage 0   _stage_init_session          初始化会话 + 自动检测 DX11/DX12
             │
             ▼  ── 逐事件循环 (_process_single_event) ──
             │
-Stage 1   _stage_build_ps_texture_map  解析 PS DXBC + PSSetShaderResources 纹理绑定
-Stage 2   _stage_build_vs_cbv_map      解析 VS DXBC + VSSetConstantBuffers CBV 绑定
+Stage 1   _stage_build_ps_texture_map  解析 PS 纹理绑定 (DXBC/DXIL, 按 API 分支)
+Stage 2   _stage_build_vs_cbv_map      解析 VS CBV 绑定 (DXBC/DXIL, 按 API 分支)
 Stage 3   _stage_classify_inputs       分类输入资源 (SRV 纹理 vs 其他)
 Stage 4   _stage_export_textures       导出 SRV 纹理 (DDS)
 Stage 5   _stage_export_other_inputs   导出其他输入 + 收集 IBV / VBV / CBV
 Stage 6   _stage_export_vbv            合并输出 VBV (vbv.json)
 Stage 7   _stage_extract_indirect_args 提取 Indirect Args (DrawIndexedInstancedIndirect)
 Stage 8   _stage_export_mesh           导出 Mesh (OBJ，支持蒙皮 + 间接绘制)
-Stage 9   _stage_export_event_shaders  导出 Shader (DXBC / HLSL)
+Stage 9   _stage_export_event_shaders  导出 Shader (DXBC / DXIL / HLSL)
 Stage 10  _stage_save_event_info       保存事件信息 (_event_info.json)
             │
             ▼  ── 循环结束 ──
@@ -121,18 +123,66 @@ easy_output/
 
 ## 核心功能
 
-### Stage 1 — 纹理绑定映射 (PSSetShaderResources)
+### Stage 0 — DX11 / DX12 自动检测
 
-插件通过解析 DXBC 和 `PSSetShaderResources` API 调用来精确映射纹理资源与 Shader 变量名。
+插件在初始化阶段自动判断当前帧捕获使用的图形 API 版本（DirectX 11 或 DirectX 12），后续所有资源绑定解析逻辑据此分支执行。
 
-#### 工作流程
+#### 检测原理
+
+DX12 引入了一组 DX11 中完全不存在的 API 调用（如 Root Signature、Descriptor Table、Pipeline State Object、Resource Barrier 等）。只要在帧的 API 调用序列中检测到任何一个 DX12 独占调用，即可确定该帧为 DX12；若扫描范围内未出现任何 DX12 独占调用，则判定为 DX11。
+
+#### 检测流程
+
+```
+1. 取帧内前 400 个 API 调用（或全部，取较小值）
+2. 逐一检查调用名称，匹配 DX12 独占特征调用
+3. 若命中数 > 0 → DX12；否则 → DX11
+```
+
+#### DX12 独占特征调用
+
+| 调用名称 | 功能说明 |
+|----------|----------|
+| `SetGraphicsRootSignature` | 设置图形根签名，定义 shader 可访问的资源布局 |
+| `SetGraphicsRootDescriptorTable` | 绑定描述符表到根签名的指定参数槽 |
+| `SetPipelineState` | 设置管线状态对象（PSO），包含 shader、混合、光栅化等全部状态 |
+| `ResourceBarrier` | 资源状态转换屏障，DX12 显式资源状态管理的核心 |
+| `ExecuteCommandLists` | 提交命令列表到 GPU 执行队列 |
+| `SetDescriptorHeaps` | 绑定描述符堆，DX12 资源绑定的基础设施 |
+
+> 以上调用均为 **DX12 独占**，在 DX11 API 中不存在。因此只需检测是否出现即可，无需与 DX11 调用做频率对比。
+
+#### 检测结果的影响
+
+检测到的 `dx_version`（`"DX11"` 或 `"DX12"`）贯穿整个导出流程：
+
+| 阶段 | DX11 | DX12 |
+|------|------|------|
+| Stage 1 纹理绑定 | 扫描 `PSSetShaderResources` API 调用，从参数中提取 slot → resource_id 映射 | 无等效 API 调用；按 `bindings["inputs"]` 中 SRV 纹理的出现顺序与 DXBC/DXIL 声明的 slot 顺序对齐推断 |
+| Stage 2 CBV 绑定 | 扫描 `VSSetConstantBuffers` API 调用，与 `bindings["inputs"]` 中的 CBV 交叉匹配 | 按 `bindings["inputs"]` 中 CBV 的出现顺序与 DXBC/DXIL 声明的 cbuffer slot 顺序对齐推断 |
+| Shader 源码获取 | 优先读取 `dxbc`，不可用时回退 `dxil` | 同左（DX12 帧通常提供 `dxil`） |
+| 绘制参数 | `IndexCount`, `StartIndexLocation` | `IndexCountPerInstance`, `StartIndexLocation` |
+
+#### 日志示例
+
+```
+[INFO] 检测到图形 API: DX11 (扫描前 400 个调用, DX12 独占命中=0)
+[INFO] 检测到图形 API: DX12 (扫描前 400 个调用, DX12 独占命中=23)
+```
+
+---
+
+### Stage 1 — 纹理绑定映射（DX11 / DX12 双路径）
+
+插件通过解析 Shader 反射信息来精确映射纹理资源与 Shader 变量名。
+
+#### DX11 路径
 
 ```
 1. 解析 PS DXBC，获取纹理绑定信息：
    ├── t0 → "tBaseMap"
    ├── t1 → "tMixMap"
-   ├── t3 → "tNormalMap"
-   └── t6 → "tEmissionMap"
+   └── t3 → "tNormalMap"
 
 2. 查找 DrawCall 之前的 PSSetShaderResources 调用：
    PSSetShaderResources(StartSlot=0, ppShaderResourceViews=[
@@ -140,22 +190,34 @@ easy_output/
        {value: 1466},  → slot 1
        {value: 0},     → slot 2 (null)
        {value: 1467},  → slot 3
-       ...
    ])
 
 3. 建立 resource_id → dxbc_name 映射：
    ├── 989  → "tBaseMap"   (slot 0)
    ├── 1466 → "tMixMap"    (slot 1)
    └── 1467 → "tNormalMap" (slot 3)
+```
 
-4. 导出纹理时使用 dxbc_name 命名
+#### DX12 路径
+
+```
+1. 解析 PS DXBC/DXIL，获取纹理绑定信息（同上）
+
+2. DX12 无 PSSetShaderResources，采用顺序推断：
+   bindings["inputs"] 中的 SRV 纹理按寄存器顺序排列，
+   依次对应 DXBC 中从小到大的 slot。
+
+3. 建立 resource_id → dxbc_name 映射
 ```
 
 ---
 
-### Stage 2 — CBV 绑定映射 (VSSetConstantBuffers)
+### Stage 2 — CBV 绑定映射（DX11 / DX12 双路径）
 
-解析 `VSSetConstantBuffers` 调用，结合 VS DXBC 的 cbuffer 绑定信息，建立完整的 CBV 映射。
+结合 VS DXBC/DXIL 的 cbuffer 绑定信息，建立完整的 CBV 映射。
+
+- **DX11**: 扫描 `VSSetConstantBuffers` 调用 + inputs CBV 交叉匹配
+- **DX12**: 按 `bindings["inputs"]` 中 CBV 顺序推断 slot 映射
 
 #### 输出文件：`vs_cbv_bindings_{program_id_hex}.json`
 
@@ -402,9 +464,9 @@ bindings = call.get_bindings()
 
 | 函数 | Stage | 说明 |
 |------|-------|------|
-| `_stage_init_session()` | 0 | 初始化会话，筛选事件，创建目录 |
-| `_stage_build_ps_texture_map()` | 1 | 解析 PS DXBC + PSSetShaderResources 纹理绑定 |
-| `_stage_build_vs_cbv_map()` | 2 | 解析 VS DXBC + VSSetConstantBuffers CBV 绑定 |
+| `_stage_init_session()` | 0 | 初始化会话 + 自动检测 DX11/DX12 |
+| `_stage_build_ps_texture_map()` | 1 | 解析 PS 纹理绑定 (DXBC/DXIL, DX11/DX12 分支) |
+| `_stage_build_vs_cbv_map()` | 2 | 解析 VS CBV 绑定 (DXBC/DXIL, DX11/DX12 分支) |
 | `_stage_classify_inputs()` | 3 | 分类输入资源 (SRV 纹理 vs 其他) |
 | `_stage_export_textures()` | 4 | 导出 SRV 纹理 (DDS) |
 | `_stage_export_other_inputs()` | 5 | 导出其他输入，收集 IBV / VBV / CBV |
@@ -420,12 +482,16 @@ bindings = call.get_bindings()
 
 | 函数 | 说明 |
 |------|------|
-| `parse_texture_bindings_from_dxbc()` | 从 DXBC 解析纹理绑定 |
-| `parse_cbuffer_bindings_from_dxbc()` | 从 DXBC 解析 cbuffer 绑定 |
-| `find_ps_set_shader_resources_before_event()` | 查找 PSSetShaderResources 调用 |
-| `find_vs_set_constant_buffers_before_event()` | 查找 VSSetConstantBuffers 调用 |
-| `build_resource_id_to_slot_map()` | 建立 resource_id → slot 映射 |
-| `build_cbv_slot_bindings()` | 建立 CBV slot 绑定列表 |
+| `parse_texture_bindings_from_dxbc()` | 从 DXBC/DXIL 解析纹理绑定 |
+| `parse_cbuffer_bindings_from_dxbc()` | 从 DXBC/DXIL 解析 cbuffer 绑定 |
+| `get_shader_source()` | 获取 shader 源码 (DXBC 优先, DXIL 回退) |
+| `find_ps_set_shader_resources_before_event()` | [DX11] 查找 PSSetShaderResources 调用 |
+| `find_vs_set_constant_buffers_before_event()` | [DX11] 查找 VSSetConstantBuffers 调用 |
+| `find_api_calls_before_event()` | 通用 API 调用查找（支持多种匹配模式） |
+| `build_resource_id_to_slot_map()` | [DX11] 建立 resource_id → slot 映射 |
+| `build_cbv_slot_bindings()` | [DX11] 建立 CBV slot 绑定列表 |
+| `build_dx12_srv_slot_map_from_bindings()` | [DX12] 按 SRV 顺序推断 slot 映射 |
+| `build_dx12_cbv_bindings_from_bindings()` | [DX12] 按 CBV 顺序推断绑定 |
 | `export_mesh_from_buffers()` | 从 IBV/VBV 导出网格（支持蒙皮 + 间接绘制） |
 | `apply_skinning()` | 应用骨骼蒙皮变换 |
 | `is_draw_indexed_instanced_indirect()` | 检测 DrawIndexedInstancedIndirect 调用 |
@@ -440,31 +506,39 @@ bindings = call.get_bindings()
 插件日志保存在 `easy_output.log`，使用 UTF-8 编码，中文正常显示。
 
 ```
-2024-12-30 13:06:13: [INFO] ============================================================
-2024-12-30 13:06:13: [INFO] easy_output 插件开始执行
-2024-12-30 13:06:13: [INFO] 函数: run(min_call=51, max_call=52, enable_skinning=1)
-2024-12-30 13:06:13: [DEBUG] Frame 名称: yysls_2025_10_29__11_44_32
-2024-12-30 13:06:13: [DEBUG] DXBC slot->name 映射: {0: 'tBaseMap', 1: 'tMixMap', 3: 'tNormalMap'}
-2024-12-30 13:06:13: [DEBUG] 找到 Skeleton CBV: resource_id=37, view_id=2
+[INFO] ============================================================
+[INFO] easy_output 插件开始执行
+[INFO] 函数: run(min_call=51, max_call=52, enable_skinning=1)
+[INFO] 检测到图形 API: DX11 (扫描前 400 个调用, DX12 独占命中=0)
+[DEBUG] Frame 名称: yysls_2025_10_29__11_44_32
+[DEBUG] [DXBC] PS slot->name 映射: {0: 'tBaseMap', 1: 'tMixMap', 3: 'tNormalMap'}
+[DEBUG] 找到 Skeleton CBV: resource_id=37, view_id=2
 ```
 
 ---
 
 ## 更新日志
 
+### 2026-03-09 v5.0
+
+- **DX11 / DX12 双 API 兼容**：
+  - Stage 0 自动检测帧捕获的图形 API 版本（扫描前 400 个调用，检测 DX12 独占 API）
+  - Stage 1/2 根据 `dx_version` 分支执行不同的资源绑定解析策略
+  - DX11: 扫描 `PSSetShaderResources` / `VSSetConstantBuffers` 建立精确映射
+  - DX12: 按 `bindings["inputs"]` 中 SRV/CBV 顺序推断映射
+  - Shader 解析兼容 DXBC 和 DXIL（优先 DXBC，回退 DXIL）
+  - 绘制参数兼容 DX12 `IndexCountPerInstance` 等参数名
+- **新增辅助函数**：
+  - `get_shader_source()`: 统一获取 shader 源码
+  - `find_api_calls_before_event()`: 通用 API 调用查找
+  - `build_dx12_srv_slot_map_from_bindings()`: DX12 SRV 映射
+  - `build_dx12_cbv_bindings_from_bindings()`: DX12 CBV 映射
+- **面片法线修复**：OBJ 导出翻转环绕方向 (D3D CW → OBJ CCW)
+
 ### 2026-03-03 v4.0
 
 - **代码架构重构**：将 ~560 行的单体 `run()` 函数拆分为 10 个独立 Stage 函数
-  - 每个 Stage 职责单一，命名清晰 (`_stage_*`)
-  - `_process_single_event()` 负责串联所有 Stage
-  - `_stage_init_session()` 返回 session 上下文字典
-  - `_finalize_export()` 统一汇总
-- **DrawIndexedInstancedIndirect 支持** (Stage 7):
-  - 自动检测 `DrawIndexedInstancedIndirect` 类型的绘制调用
-  - 从 `view_type="args"` 的 buffer 中提取间接绘制参数
-  - 解析 20 字节的间接参数结构体
-  - 使用 `StartIndexLocation` 和 `IndexCountPerInstance` 精确提取索引范围
-  - 在 `_event_info.json` 中输出 `indirect_args` 信息
+- **DrawIndexedInstancedIndirect 支持** (Stage 7)
 
 ### 2024-12-30 v3.0
 

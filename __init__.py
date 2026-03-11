@@ -94,55 +94,40 @@ from logs import messages as _original_messages
 
 class UTF8Messages:
     """
-    包装 messages 对象，确保日志使用 UTF-8 编码写入
-    同时写入到独立的 easy_output.log 文件
+    包装 messages 对象，确保日志使用 UTF-8 编码写入 easy_output.log。
+    每次写入独立 open/close，避免长驻句柄在 Windows 上的缓冲和编码问题。
     """
     def __init__(self, original_messages):
         self._original = original_messages
-        self._log_file = None
-        self._log_path = None
-    
-    def _get_log_file(self):
-        """获取日志文件句柄，延迟初始化"""
-        if self._log_file is None:
-            try:
-                # 获取插件目录
-                plugin_dir = os.path.dirname(os.path.abspath(__file__))
-                self._log_path = os.path.join(plugin_dir, "easy_output.log")
-                self._log_file = open(self._log_path, 'a', encoding='utf-8')
-            except Exception:
-                pass
-        return self._log_file
-    
-    def _write_to_file(self, msg):
-        """写入到文件"""
+        self._log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "easy_output.log"
+        )
+
+    def _write_to_file(self, level, msg):
         try:
-            f = self._get_log_file()
-            if f:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                f.write(f"{timestamp}: {msg}\n")
-                f.flush()
+            text = str(msg)
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"{timestamp}: [{level}] {text}\n"
+            with open(self._log_path, 'a', encoding='utf-8', errors='replace') as f:
+                f.write(line)
         except Exception:
             pass
-    
+
     def debug(self, msg):
-        """调试日志 - 仅写入 UTF-8 文件，不调用原始方法避免乱码"""
-        self._write_to_file(f"[DEBUG] {msg}")
-    
+        self._write_to_file("DEBUG", msg)
+
     def info(self, msg):
-        """信息日志 - 仅写入 UTF-8 文件"""
-        self._write_to_file(f"[INFO] {msg}")
-    
+        self._write_to_file("INFO", msg)
+
     def warning(self, msg):
-        """警告日志 - 仅写入 UTF-8 文件"""
-        self._write_to_file(f"[WARNING] {msg}")
-    
+        self._write_to_file("WARNING", msg)
+
     def error(self, msg):
-        """错误日志 - 仅写入 UTF-8 文件"""
-        self._write_to_file(f"[ERROR] {msg}")
-    
+        self._write_to_file("ERROR", msg)
+
     def __getattr__(self, name):
-        """转发其他属性到原始对象"""
         return getattr(self._original, name)
 
 
@@ -462,9 +447,12 @@ def export_texture(resources_accessor, texture_resource, call, output_dir, res_i
         first_mip = desc.get("first_mip", 0)
         first_slice = desc.get("first_slice", 0)
         
+        # DX12 proxy -> 使用底层 MemoryResource
+        actual_resource = _unwrap_dx12_resource(texture_resource) if '_DX12ResourceProxy' in globals() else texture_resource
+        
         # 创建图像请求
         image_request = ImageRequest(
-            image=texture_resource,
+            image=actual_resource,
             mip=first_mip,
             slice_=first_slice,
             call=call,
@@ -472,7 +460,11 @@ def export_texture(resources_accessor, texture_resource, call, output_dir, res_i
         )
         
         # 获取图像数据
-        result = resources_accessor.get_images_data([image_request], timeout=30000)
+        try:
+            result = resources_accessor.get_images_data([image_request], timeout=30000)
+        except UnicodeDecodeError as ude:
+            messages.debug(f"导出纹理 {res_id} 原生 API UnicodeDecodeError: {ude}")
+            return None
         
         if image_request not in result:
             return None
@@ -917,8 +909,9 @@ def export_buffer(resources_accessor, buffer_resource, call, output_dir, res_id)
         if size == 768:
             try:
                 # 获取缓冲区数据
+                actual_buf = _unwrap_dx12_resource(buffer_resource)
                 buffer_request = BufferRequest(
-                    buffer=buffer_resource,
+                    buffer=actual_buf,
                     call=call,
                     extract_before=False
                 )
@@ -1111,7 +1104,12 @@ def save_as_png(raw_data, width, height, row_pitch, output_path, tex_format):
 
 def get_draw_call_params(call_desc):
     """
-    从 API 调用描述中提取绘制调用参数
+    从 API 调用描述中提取绘制调用参数（兼容 DX11 和 DX12）
+    
+    DX11 DrawIndexed:          IndexCount, StartIndexLocation, BaseVertexLocation
+    DX12 DrawIndexedInstanced: IndexCountPerInstance, InstanceCount, StartIndexLocation,
+                               BaseVertexLocation, StartInstanceLocation
+    
     返回: (index_count, start_index_location, base_vertex_location)
     """
     index_count = 0
@@ -1123,14 +1121,14 @@ def get_draw_call_params(call_desc):
         arg_name = arg.get("name", "").lower()
         arg_value = arg.get("value", 0)
         
-        if arg_name in ["indexcount", "index_count"]:
+        if arg_name in ["indexcount", "index_count",
+                         "indexcountperinstance", "index_count_per_instance"]:
             index_count = int(arg_value) if arg_value else 0
         elif arg_name in ["startindexlocation", "start_index_location"]:
             start_index_location = int(arg_value) if arg_value else 0
         elif arg_name in ["basevertexlocation", "base_vertex_location"]:
             base_vertex_location = int(arg_value) if arg_value else 0
         elif arg_name in ["vertexcount", "vertex_count"]:
-            # 对于 Draw 调用（非 DrawIndexed）
             if index_count == 0:
                 index_count = int(arg_value) if arg_value else 0
     
@@ -1377,13 +1375,18 @@ def export_mesh_to_obj(resources_accessor, call, geometry_info, output_dir, even
         if not main_buffer:
             return None
         
+        actual_main = _unwrap_dx12_resource(main_buffer)
         buffer_request = BufferRequest(
-            buffer=main_buffer,
+            buffer=actual_main,
             call=call,
             extract_before=False
         )
         
-        buffer_result = resources_accessor.get_buffers_data([buffer_request], timeout=30000)
+        try:
+            buffer_result = resources_accessor.get_buffers_data([buffer_request], timeout=30000)
+        except UnicodeDecodeError as ude:
+            messages.debug(f"读取主顶点缓冲区 UnicodeDecodeError: {ude}")
+            return None
         
         if buffer_request not in buffer_result:
             return None
@@ -1418,8 +1421,9 @@ def export_mesh_to_obj(resources_accessor, call, geometry_info, output_dir, even
             if index_buffer_id_str in all_resources:
                 index_buffer = all_resources[index_buffer_id_str][0]
                 
+                actual_idx = _unwrap_dx12_resource(index_buffer)
                 index_request = BufferRequest(
-                    buffer=index_buffer,
+                    buffer=actual_idx,
                     call=call,
                     extract_before=False
                 )
@@ -1599,92 +1603,97 @@ def export_shader_il(program, shader_type, il_type, output_dir, program_id_hex):
 
 def parse_texture_bindings_from_dxbc(dxbc_source):
     """
-    从 DXBC 反汇编文本中逐行解析 Resource Bindings，
-    提取 type 为 texture 的内容
-    
-    解析格式:
-    // Name                                 Type  Format         Dim      HLSL Bind  Count
-    // ------------------------------ ---------- ------- ----------- -------------- ------
-    // tBaseMap                          texture  float4          2d             t0      1 
-    
+    从 DXBC / DXIL 反汇编文本中逐行解析 Resource Bindings，
+    提取 type 为 texture 的内容。
+
+    兼容两种格式:
+      DXBC (注释前缀 //):
+        // Name                                 Type  Format         Dim      HLSL Bind  Count
+        // tBaseMap                          texture  float4          2d             t0      1
+
+      DXIL (注释前缀 ;，额外 ID 列):
+        ; Name                                 Type  Format         Dim      ID      HLSL Bind  Count
+        ; tBaseMap                          texture     f32          2d      T0             t0     1
+
     返回:
-        [{"name": "tBaseMap", "type": "texture", "format": "float4", "dim": "2d", "slot": "t0", "count": 1}]
+        [{"name": "tBaseMap", "type": "texture", "format": "...", "dim": "2d", "slot": "t0", "count": 1}]
     """
     import re
-    
+
     textures = []
-    
+
     if not dxbc_source:
         return textures
-    
-    # 确保是字符串
+
     if isinstance(dxbc_source, bytes):
         try:
             dxbc_source = dxbc_source.decode('utf-8', errors='ignore')
         except:
             dxbc_source = dxbc_source.decode('latin-1', errors='ignore')
-    
-    # 逐行解析
+
     in_bindings_section = False
     header_found = False
-    
+    is_dxil = False
+
     lines = dxbc_source.split('\n')
     for line_num, line in enumerate(lines):
-        original_line = line
         line = line.strip()
-        
-        # 检测 Resource Bindings 部分开始
+
         if "Resource Bindings:" in line:
             in_bindings_section = True
-            messages.debug(f"[DXBC 解析] 第 {line_num + 1} 行: 找到 Resource Bindings 部分")
+            messages.debug(f"[Shader 解析] 第 {line_num + 1} 行: 找到 Resource Bindings 部分")
             continue
-        
-        # 检测表头行
+
         if in_bindings_section and "Name" in line and "HLSL Bind" in line:
             header_found = True
-            messages.debug(f"[DXBC 解析] 第 {line_num + 1} 行: 找到表头")
+            is_dxil = "ID" in line and line.lstrip(";/ ").startswith("Name")
+            messages.debug(f"[Shader 解析] 第 {line_num + 1} 行: 找到表头 ({'DXIL' if is_dxil else 'DXBC'} 格式)")
             continue
-        
-        # 检测分隔线（跳过）
-        if in_bindings_section and "// ---" in line:
+
+        if in_bindings_section and ("// ---" in line or "; ---" in line):
             continue
-        
-        # 检测绑定部分结束
+
         if in_bindings_section and header_found:
-            # 空行或非注释行表示结束
-            if not line or (not line.startswith("//")):
+            if not line or (not line.startswith("//") and not line.startswith(";")):
                 in_bindings_section = False
                 continue
-            
-            # 只处理纯注释空行
-            if line == "//":
+
+            if line in ("//", ";"):
                 in_bindings_section = False
                 continue
-            
-            # 解析资源绑定行
+
             if line.startswith("//"):
                 content = line[2:].strip()
-                
-                # 使用正则匹配: Name Type Format Dim Bind Count
-                # 示例: tBaseMap                          texture  float4          2d             t0      1 
-                match = re.match(r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)', content)
-                if match:
-                    name, res_type, fmt, dim, bind, count = match.groups()
-                    
-                    # 只提取 texture 类型
-                    if res_type == "texture":
-                        texture_info = {
-                            "name": name,
-                            "type": res_type,
-                            "format": fmt,
-                            "dim": dim,
-                            "slot": bind,
-                            "count": int(count),
-                            "line_number": line_num + 1
-                        }
-                        textures.append(texture_info)
-                        messages.debug(f"[DXBC 解析] 第 {line_num + 1} 行: 找到纹理 {name} -> {bind}")
-    
+            elif line.startswith(";"):
+                content = line[1:].strip()
+            else:
+                continue
+
+            if is_dxil:
+                match = re.match(
+                    r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)',
+                    content)
+            else:
+                match = re.match(
+                    r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)',
+                    content)
+
+            if match:
+                name, res_type, fmt, dim, bind, count = match.groups()
+
+                if res_type == "texture":
+                    texture_info = {
+                        "name": name,
+                        "type": res_type,
+                        "format": fmt,
+                        "dim": dim,
+                        "slot": bind,
+                        "count": int(count),
+                        "line_number": line_num + 1
+                    }
+                    textures.append(texture_info)
+                    messages.debug(f"[Shader 解析] 第 {line_num + 1} 行: 找到纹理 {name} -> {bind}")
+
     return textures
 
 
@@ -1707,154 +1716,93 @@ def export_shaders(program, output_dir, event_index):
         program_desc = program.get_description()
         program_id = program_desc.get("id", "unknown")
         program_id_hex = format(int(program_id), 'X') if str(program_id).isdigit() else str(program_id)
-        
+
+        # 打印可用的 shader 数据
+        for stage_name in ["vertex", "pixel"]:
+            si = program_desc.get(stage_name, {})
+            if isinstance(si, dict):
+                has_source = bool(si.get("source"))
+                has_dxbc = bool(si.get("dxbc"))
+                has_dxil = bool(si.get("dxil"))
+                messages.debug(f"[g_{event_index}] {stage_name}: source={has_source}, "
+                               f"dxbc={has_dxbc}, dxil={has_dxil}")
+
         # 导出 Vertex Shader (顶点着色器)
         if "vertex" in program_desc:
             vs_info = program_desc["vertex"]
             vs_source = vs_info.get("source", "")
             vs_hash = vs_info.get("hash", "")
-            
+
             if vs_source:
                 vs_file = os.path.join(output_dir, f"vs_{program_id_hex}.hlsl")
                 with open(vs_file, 'w', encoding='utf-8') as f:
-                    f.write(f"//==============================================================================\n")
-                    f.write(f"// 顶点着色器 (Vertex Shader)\n")
-                    f.write(f"//==============================================================================\n")
-                    f.write(f"// 程序 ID: {program_id} (0x{program_id_hex})\n")
+                    f.write(f"// Vertex Shader | Program 0x{program_id_hex} | Event {event_index}\n")
                     if vs_hash:
-                        f.write(f"// 哈希值: {vs_hash}\n")
-                    f.write(f"// 事件索引: {event_index}\n")
-                    f.write(f"//\n")
-                    f.write(f"// 功能说明:\n")
-                    f.write(f"//   顶点着色器负责处理每个顶点的变换，包括:\n")
-                    f.write(f"//   - 将顶点从模型空间变换到裁剪空间\n")
-                    f.write(f"//   - 计算顶点属性（法线、纹理坐标等）的插值\n")
-                    f.write(f"//   - 传递数据给像素着色器\n")
-                    f.write(f"//==============================================================================\n\n")
+                        f.write(f"// Hash: {vs_hash}\n")
+                    f.write(f"\n")
                     f.write(vs_source)
-                exported_shaders.append({
-                    "type": "vertex",
-                    "file": os.path.basename(vs_file)
-                })
-            
-            # 尝试导出 DXBC (DX11)
+                exported_shaders.append({"type": "vertex", "file": os.path.basename(vs_file)})
+
             vs_dxbc = vs_info.get("dxbc", "")
             if vs_dxbc:
                 vs_dxbc_file = os.path.join(output_dir, f"vs_{program_id_hex}.dxbc")
-                with open(vs_dxbc_file, 'wb') as f:
-                    if isinstance(vs_dxbc, str):
-                        f.write(vs_dxbc.encode('latin-1'))
-                    else:
-                        f.write(bytes(vs_dxbc))
-                exported_shaders.append({
-                    "type": "vertex_dxbc",
-                    "file": os.path.basename(vs_dxbc_file)
-                })
-                
-            
-            # 尝试通过 API 获取 DXIL
-            dxil_result = export_shader_il(program, "vertex", "dxil", output_dir, program_id_hex)
-            if dxil_result:
-                exported_shaders.append(dxil_result)
-            elif vs_info.get("dxil", ""):
-                # 回退：使用描述中的 DXIL
-                vs_dxil = vs_info.get("dxil", "")
+                with open(vs_dxbc_file, 'w', encoding='utf-8', errors='replace') as f:
+                    f.write(vs_dxbc if isinstance(vs_dxbc, str) else vs_dxbc.decode('utf-8', errors='replace'))
+                exported_shaders.append({"type": "vertex_dxbc", "file": os.path.basename(vs_dxbc_file)})
+
+            vs_dxil = vs_info.get("dxil", "")
+            if vs_dxil:
                 vs_dxil_file = os.path.join(output_dir, f"vs_{program_id_hex}.dxil")
-                with open(vs_dxil_file, 'wb') as f:
-                    if isinstance(vs_dxil, str):
-                        f.write(vs_dxil.encode('utf-8'))
-                    else:
-                        f.write(bytes(vs_dxil))
-                exported_shaders.append({
-                    "type": "vertex_dxil",
-                    "file": os.path.basename(vs_dxil_file)
-                })
-            
-        
+                with open(vs_dxil_file, 'w', encoding='utf-8', errors='replace') as f:
+                    f.write(vs_dxil if isinstance(vs_dxil, str) else vs_dxil.decode('utf-8', errors='replace'))
+                exported_shaders.append({"type": "vertex_dxil", "file": os.path.basename(vs_dxil_file)})
+
         # 导出 Pixel Shader (像素着色器)
         if "pixel" in program_desc:
             ps_info = program_desc["pixel"]
             ps_source = ps_info.get("source", "")
             ps_hash = ps_info.get("hash", "")
-            
+
             if ps_source:
                 ps_file = os.path.join(output_dir, f"ps_{program_id_hex}.hlsl")
                 with open(ps_file, 'w', encoding='utf-8') as f:
-                    f.write(f"//==============================================================================\n")
-                    f.write(f"// 像素着色器 (Pixel Shader)\n")
-                    f.write(f"//==============================================================================\n")
-                    f.write(f"// 程序 ID: {program_id} (0x{program_id_hex})\n")
+                    f.write(f"// Pixel Shader | Program 0x{program_id_hex} | Event {event_index}\n")
                     if ps_hash:
-                        f.write(f"// 哈希值: {ps_hash}\n")
-                    f.write(f"// 事件索引: {event_index}\n")
-                    f.write(f"//\n")
-                    f.write(f"// 功能说明:\n")
-                    f.write(f"//   像素着色器负责计算每个像素的最终颜色，包括:\n")
-                    f.write(f"//   - 纹理采样和混合\n")
-                    f.write(f"//   - 光照计算\n")
-                    f.write(f"//   - 材质效果处理\n")
-                    f.write(f"//   - 输出最终像素颜色\n")
-                    f.write(f"//==============================================================================\n\n")
+                        f.write(f"// Hash: {ps_hash}\n")
+                    f.write(f"\n")
                     f.write(ps_source)
-                exported_shaders.append({
-                    "type": "pixel",
-                    "file": os.path.basename(ps_file)
-                })
-            
-            # 尝试导出 DXBC (DX11)
+                exported_shaders.append({"type": "pixel", "file": os.path.basename(ps_file)})
+
             ps_dxbc = ps_info.get("dxbc", "")
             if ps_dxbc:
                 ps_dxbc_file = os.path.join(output_dir, f"ps_{program_id_hex}.dxbc")
-                with open(ps_dxbc_file, 'wb') as f:
-                    if isinstance(ps_dxbc, str):
-                        f.write(ps_dxbc.encode('latin-1'))
-                    else:
-                        f.write(bytes(ps_dxbc))
-                exported_shaders.append({
-                    "type": "pixel_dxbc",
-                    "file": os.path.basename(ps_dxbc_file)
-                })
-            
-            # 从 PS DXBC 中解析纹理绑定并输出到 JSON
-            ps_textures = parse_texture_bindings_from_dxbc(ps_dxbc)
+                with open(ps_dxbc_file, 'w', encoding='utf-8', errors='replace') as f:
+                    f.write(ps_dxbc if isinstance(ps_dxbc, str) else ps_dxbc.decode('utf-8', errors='replace'))
+                exported_shaders.append({"type": "pixel_dxbc", "file": os.path.basename(ps_dxbc_file)})
+
+            ps_dxil = ps_info.get("dxil", "")
+            if ps_dxil:
+                ps_dxil_file = os.path.join(output_dir, f"ps_{program_id_hex}.dxil")
+                with open(ps_dxil_file, 'w', encoding='utf-8', errors='replace') as f:
+                    f.write(ps_dxil if isinstance(ps_dxil, str) else ps_dxil.decode('utf-8', errors='replace'))
+                exported_shaders.append({"type": "pixel_dxil", "file": os.path.basename(ps_dxil_file)})
+
+            # 从 PS shader 中解析纹理绑定（优先 DXBC，回退 DXIL）
+            ps_shader_source = ps_dxbc if ps_dxbc else ps_dxil
+            ps_textures = parse_texture_bindings_from_dxbc(ps_shader_source)
             if ps_textures:
                 texture_bindings_file = os.path.join(output_dir, f"ps_texture_bindings_{program_id_hex}.json")
                 with open(texture_bindings_file, 'w', encoding='utf-8') as f:
-                    texture_bindings_data = {
+                    json.dump({
                         "program_id": program_id,
                         "program_id_hex": program_id_hex,
                         "shader_type": "pixel",
                         "event_index": event_index,
                         "texture_count": len(ps_textures),
                         "textures": ps_textures
-                    }
-                    json.dump(texture_bindings_data, f, indent=2, ensure_ascii=False)
-                exported_shaders.append({
-                    "type": "ps_texture_bindings",
-                    "file": os.path.basename(texture_bindings_file)
-                })
+                    }, f, indent=2, ensure_ascii=False)
+                exported_shaders.append({"type": "ps_texture_bindings", "file": os.path.basename(texture_bindings_file)})
                 messages.debug(f"已导出 PS 纹理绑定: {len(ps_textures)} 个纹理")
-            
-            # 尝试通过 API 获取 DXIL
-            dxil_result = export_shader_il(program, "pixel", "dxil", output_dir, program_id_hex)
-            if dxil_result:
-                exported_shaders.append(dxil_result)
-            elif ps_info.get("dxil", ""):
-                # 回退：使用描述中的 DXIL
-                ps_dxil = ps_info.get("dxil", "")
-                ps_dxil_file = os.path.join(output_dir, f"ps_{program_id_hex}.dxil")
-                with open(ps_dxil_file, 'wb') as f:
-                    if isinstance(ps_dxil, str):
-                        f.write(ps_dxil.encode('utf-8'))
-                    else:
-                        f.write(bytes(ps_dxil))
-                exported_shaders.append({
-                    "type": "pixel_dxil",
-                    "file": os.path.basename(ps_dxil_file)
-                })
-            
-        
-        # shader_info 文件已取消输出，shader 信息在 vs/ps dxbc 文件中包含
         
     except Exception as e:
         messages.debug(f"导出 shader 失败 (event {event_index}): {str(e)}")
@@ -1896,13 +1844,18 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
             index_count, start_index_location, base_vertex_location = get_draw_call_params(call_desc)
         
         # ==================== 先读取索引数据，计算实际 vertex_count ====================
+        actual_ibv = _unwrap_dx12_resource(ibv_resource)
         ibv_request = BufferRequest(
-            buffer=ibv_resource,
+            buffer=actual_ibv,
             call=call,
             extract_before=False
         )
         
-        ibv_result = resources_accessor.get_buffers_data([ibv_request], timeout=30000)
+        try:
+            ibv_result = resources_accessor.get_buffers_data([ibv_request], timeout=30000)
+        except UnicodeDecodeError as ude:
+            messages.debug(f"读取 IBV 数据 UnicodeDecodeError (event {event_index}): {ude}")
+            return None
         
         if ibv_request not in ibv_result:
             return None
@@ -1977,13 +1930,18 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
                 return None
         
         # 读取顶点数据
+        actual_vbv = _unwrap_dx12_resource(main_vbv)
         vbv_request = BufferRequest(
-            buffer=main_vbv,
+            buffer=actual_vbv,
             call=call,
             extract_before=False
         )
         
-        vbv_result = resources_accessor.get_buffers_data([vbv_request], timeout=30000)
+        try:
+            vbv_result = resources_accessor.get_buffers_data([vbv_request], timeout=30000)
+        except UnicodeDecodeError as ude:
+            messages.debug(f"读取 VBV 数据 UnicodeDecodeError (event {event_index}): {ude}")
+            return None
         
         if vbv_request not in vbv_result:
             return None
@@ -2051,8 +2009,9 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
                         cbv_desc = target_cbv.get_description()
                         cbv_size = cbv_desc.get("size", 0)
                         cbv_res_id = cbv_desc.get("resource_id", -1)
+                        actual_cbv = _unwrap_dx12_resource(target_cbv)
                         cbv_request = BufferRequest(
-                            buffer=target_cbv,
+                            buffer=actual_cbv,
                             call=call,
                             extract_before=False
                         )
@@ -2068,8 +2027,9 @@ def export_mesh_from_buffers(resources_accessor, ibv_resource, vbv_resources, ca
             # 读取骨骼索引和权重（只读取需要的顶点数量）
             if bone_vbv and skeleton_data:
                 try:
+                    actual_bone = _unwrap_dx12_resource(bone_vbv)
                     bone_request = BufferRequest(
-                        buffer=bone_vbv,
+                        buffer=actual_bone,
                         call=call,
                         extract_before=False
                     )
@@ -2318,87 +2278,90 @@ def build_resource_id_to_dxbc_name_map(resource_id_to_slot, dxbc_texture_map):
 
 def parse_cbuffer_bindings_from_dxbc(dxbc_source):
     """
-    从 DXBC 反汇编文本中解析 Resource Bindings，
-    提取 type 为 cbuffer 的内容
-    
-    解析格式:
-    // Name                                 Type  Format         Dim      HLSL Bind  Count
-    // ------------------------------ ---------- ------- ----------- -------------- ------
-    // cbPerFrame                         cbuffer      NA          NA            cb0      1
-    
+    从 DXBC / DXIL 反汇编文本中解析 Resource Bindings，
+    提取 type 为 cbuffer 的内容。
+
+    兼容两种格式:
+      DXBC (注释前缀 //，6 列):  Name Type Format Dim Bind Count
+      DXIL (注释前缀 ;，7 列):   Name Type Format Dim ID Bind Count
+
     返回:
         [{"name": "cbPerFrame", "slot": "cb0", "slot_index": 0}]
     """
     import re
-    
+
     cbuffers = []
-    
+
     if not dxbc_source:
         return cbuffers
-    
-    # 确保是字符串
+
     if isinstance(dxbc_source, bytes):
         try:
             dxbc_source = dxbc_source.decode('utf-8', errors='ignore')
         except:
             dxbc_source = dxbc_source.decode('latin-1', errors='ignore')
-    
-    # 逐行解析
+
     in_bindings_section = False
     header_found = False
-    
+    is_dxil = False
+
     lines = dxbc_source.split('\n')
     for line_num, line in enumerate(lines):
         line = line.strip()
-        
-        # 检测 Resource Bindings 部分开始
+
         if "Resource Bindings:" in line:
             in_bindings_section = True
             continue
-        
-        # 检测表头行
+
         if in_bindings_section and "Name" in line and "HLSL Bind" in line:
             header_found = True
+            is_dxil = "ID" in line and line.lstrip(";/ ").startswith("Name")
             continue
-        
-        # 检测分隔线（跳过）
-        if in_bindings_section and "// ---" in line:
+
+        if in_bindings_section and ("// ---" in line or "; ---" in line):
             continue
-        
-        # 检测绑定部分结束
+
         if in_bindings_section and header_found:
-            if not line or (not line.startswith("//")):
+            if not line or (not line.startswith("//") and not line.startswith(";")):
                 in_bindings_section = False
                 continue
-            
-            if line == "//":
+
+            if line in ("//", ";"):
                 in_bindings_section = False
                 continue
-            
-            # 解析资源绑定行
+
             if line.startswith("//"):
                 content = line[2:].strip()
-                
-                # 使用正则匹配: Name Type Format Dim Bind Count
-                match = re.match(r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)', content)
-                if match:
-                    name, res_type, fmt, dim, bind, count = match.groups()
-                    
-                    # 只提取 cbuffer 类型
-                    if res_type == "cbuffer":
-                        try:
-                            # "cb0" -> 0
-                            slot_index = int(bind[2:]) if bind.startswith("cb") else -1
-                            cbuffer_info = {
-                                "name": name,
-                                "slot": bind,
-                                "slot_index": slot_index
-                            }
-                            cbuffers.append(cbuffer_info)
-                            messages.debug(f"[DXBC 解析] 找到 cbuffer {name} -> {bind}")
-                        except ValueError:
-                            pass
-    
+            elif line.startswith(";"):
+                content = line[1:].strip()
+            else:
+                continue
+
+            if is_dxil:
+                match = re.match(
+                    r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)',
+                    content)
+            else:
+                match = re.match(
+                    r'(\S+)\s+(texture|sampler|cbuffer|UAV)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)',
+                    content)
+
+            if match:
+                name, res_type, fmt, dim, bind, count = match.groups()
+
+                if res_type == "cbuffer":
+                    try:
+                        slot_index = int(bind[2:]) if bind.startswith("cb") else -1
+                        cbuffer_info = {
+                            "name": name,
+                            "slot": bind,
+                            "slot_index": slot_index
+                        }
+                        cbuffers.append(cbuffer_info)
+                        messages.debug(f"[Shader 解析] 找到 cbuffer {name} -> {bind}")
+                    except ValueError:
+                        pass
+
     return cbuffers
 
 
@@ -2492,6 +2455,159 @@ def build_cbv_slot_bindings(vs_set_cb_calls):
 
 
 # =============================================================================
+# DX12 — 资源绑定解析
+# =============================================================================
+
+def find_api_calls_before_event(all_calls, target_call, name_filter):
+    """
+    通用函数：查找目标 event 之前、上一个 event 之后、名称匹配 name_filter 的调用。
+    
+    name_filter 可以是:
+      - str:  精确匹配
+      - tuple/list:  any(name.startswith(n) for n in name_filter)
+      - callable:  name_filter(name) → bool
+    """
+    target_idx = -1
+    for i, c in enumerate(all_calls):
+        if c == target_call:
+            target_idx = i
+            break
+    if target_idx <= 0:
+        return []
+
+    if isinstance(name_filter, str):
+        _match = lambda n: n == name_filter
+    elif isinstance(name_filter, (list, tuple)):
+        _match = lambda n: any(n.startswith(prefix) for prefix in name_filter)
+    else:
+        _match = name_filter
+
+    result = []
+    for i in range(target_idx - 1, -1, -1):
+        c = all_calls[i]
+        desc = c.get_description()
+        if desc.get('is_event', False):
+            break
+        if _match(desc.get('name', '')):
+            result.insert(0, c)
+    return result
+
+
+def build_dx12_srv_slot_map_from_bindings(bindings, dxbc_texture_map):
+    """
+    DX12 回退：按 bindings 中 SRV 纹理的顺序推断 slot 映射。
+    
+    GPA 的 bindings["inputs"] 通常按寄存器顺序排列。
+    如果 DXBC slot 集合为 {0, 1, 3}，SRV 纹理顺序为 [A, B, C]，
+    则 A→slot 0, B→slot 1, C→slot 3。
+    
+    返回: resource_id_to_slot dict, resource_id_to_dxbc_name dict
+    """
+    resource_id_to_slot = {}
+    resource_id_to_dxbc_name = {}
+
+    if not dxbc_texture_map:
+        return resource_id_to_slot, resource_id_to_dxbc_name
+
+    # 收集 SRV 纹理（view_id==0），保持顺序
+    srv_textures = []
+    for res in bindings.get("inputs", []):
+        d = res.get_description()
+        if d.get("view_type") == "SRV" and d.get("resource_type") == "texture" and d.get("view_id", -1) == 0:
+            srv_textures.append(d.get("resource_id"))
+
+    # 按 slot 从小到大排列 DXBC 声明的纹理 slot
+    sorted_slots = sorted(dxbc_texture_map.keys())
+
+    for i, res_id in enumerate(srv_textures):
+        if i < len(sorted_slots):
+            slot = sorted_slots[i]
+            resource_id_to_slot[res_id] = slot
+            resource_id_to_dxbc_name[res_id] = dxbc_texture_map[slot]
+
+    if resource_id_to_dxbc_name:
+        messages.debug(f"[DX12] SRV 顺序推断映射: {resource_id_to_dxbc_name}")
+
+    return resource_id_to_slot, resource_id_to_dxbc_name
+
+
+def build_dx12_cbv_bindings_from_bindings(bindings, dxbc_cbuffer_map):
+    """
+    DX12 回退：按 bindings 中 CBV 的顺序推断 slot 映射。
+    
+    返回: (cbv_bindings list, skeleton_cbv_info or None)
+    """
+    cbv_bindings = []
+    skeleton_cbv_info = None
+
+    if not dxbc_cbuffer_map:
+        return cbv_bindings, skeleton_cbv_info
+
+    # 收集 CBV 资源，保持顺序
+    cbv_list = []
+    for res in bindings.get("inputs", []):
+        d = res.get_description()
+        if d.get("view_type") == "CBV":
+            cbv_list.append(d)
+
+    sorted_slots = sorted(dxbc_cbuffer_map.keys())
+
+    for i, cbv_desc in enumerate(cbv_list):
+        if i < len(sorted_slots):
+            slot_index = sorted_slots[i]
+        else:
+            slot_index = i
+
+        dxbc_name = dxbc_cbuffer_map.get(slot_index, "")
+        resource_id = cbv_desc.get("resource_id", 0)
+        view_id = cbv_desc.get("view_id", 0)
+
+        binding = {
+            "slot": f"cb{slot_index}",
+            "slot_index": slot_index,
+            "dxbc_name": dxbc_name,
+            "resource_id": resource_id,
+            "resource_id_hex": f"{resource_id:X}" if resource_id else "",
+            "view_id": view_id,
+            "view_id_hex": f"{view_id:X}" if view_id else "",
+            "offset": cbv_desc.get("offset", 0),
+            "stride": cbv_desc.get("stride", 0),
+            "size": cbv_desc.get("size", 0),
+            "resource_type": cbv_desc.get("resource_type", "buffer")
+        }
+        cbv_bindings.append(binding)
+
+        if dxbc_name == "Skeleton":
+            skeleton_cbv_info = {"resource_id": resource_id, "view_id": view_id}
+            messages.debug(f"[DX12] 找到 Skeleton CBV: resource_id={resource_id}, view_id={view_id}")
+
+    if cbv_bindings:
+        messages.debug(f"[DX12] CBV 顺序推断绑定: {len(cbv_bindings)} 个")
+
+    return cbv_bindings, skeleton_cbv_info
+
+
+def get_shader_source(program_desc, stage_name):
+    """
+    从 program description 中获取指定阶段的 shader 源码（兼容 DXBC / DXIL）。
+    优先使用 dxbc，不可用时回退到 dxil。
+    
+    stage_name: "vertex" 或 "pixel"
+    返回: (shader_source_str, source_type)  source_type 为 "dxbc" / "dxil" / None
+    """
+    if not program_desc or stage_name not in program_desc:
+        return "", None
+    info = program_desc[stage_name]
+    dxbc = info.get("dxbc", "")
+    if dxbc:
+        return dxbc, "dxbc"
+    dxil = info.get("dxil", "")
+    if dxil:
+        return dxil, "dxil"
+    return "", None
+
+
+# =============================================================================
 # Stage functions — 每个 Stage 负责 run() 主流程中的一个独立阶段
 # =============================================================================
 
@@ -2539,6 +2655,85 @@ def _stage_init_session(min_call, max_call, enable_skinning):
     if not os.path.exists(resources_dir):
         os.makedirs(resources_dir)
 
+    # 检测 DirectX 版本：扫描前 400 个 API 调用，存在 DX12 独占调用则判定为 DX12
+    DX12_EXCLUSIVE = ("SetGraphicsRootSignature", "SetGraphicsRootDescriptorTable",
+                      "SetPipelineState", "ResourceBarrier",
+                      "ExecuteCommandLists", "SetDescriptorHeaps")
+    dx_version = "DX11"
+    scan_limit = min(400, len(all_calls))
+    for ci in range(scan_limit):
+        cname = all_calls[ci].get_description().get("name", "")
+        if any(cname.startswith(marker) for marker in DX12_EXCLUSIVE):
+            dx_version = "DX12"
+            break
+
+    messages.info(f"检测到图形 API: {dx_version}")
+
+    # DX12: 一次性加载所有事件的 bindings
+    # 注意: get_event_bindings() 和 call.get_bindings() 在 DX12 下会崩溃连接，只能用 get_all_event_bindings
+    dx12_all_bindings = {}
+    dx12_parsed_full = {}
+
+
+    #方法	作用	对我们的价值
+    # debug_message	向 GPA 调试控制台发送消息	低 — 调试用
+    # get_all_event_bindings	一次性获取所有事件的绑定信息（JSON）	已在用 — 返回 inputs/outputs/execution
+    # get_apilog	获取 API 调用日志	低 — 已通过 plugin_api 获取
+    # get_event_bindings	获取单个事件的绑定信息	高 — 可能能直接获取某个事件的 execution/program
+    # get_frame_metadata	获取帧元数据（路径、名称等）	已在用
+    # get_il_source	获取着色器 IL 源码（DXBC/DXIL）	中 — _DX12ProgramProxy 可用
+    # get_memory_resources	获取内存资源列表	已通过 resources_accessor 使用
+    # get_memory_resources_usages	获取内存资源的使用关系	高 — 可能包含 resource→event 或 PSO→program 映射
+    # get_metrics_descriptions	获取性能指标描述	低 — 性能分析用
+    # get_metrics_for_ranges	获取指定范围的性能指标	低 — 性能分析用
+    # get_programs	获取所有着色器 Program	已在用
+    # get_subresource_data	获取子资源数据（纹理 mip/slice 等）	中 — 可替代 ImageRequest
+
+    if dx_version == "DX12":
+        try:
+            import plugin_adapter_interface as pai
+            iface = pai.get_interface()
+            raw = iface.get_all_event_bindings(False)
+            parsed = json.loads(raw)
+            dx12_parsed_full = parsed
+            dx12_all_bindings = parsed.get("apilog", {})
+            messages.info(f"DX12 bindings 加载成功: {len(dx12_all_bindings)} 个事件, JSON {len(raw)} 字节")
+
+
+            # event_bindings = iface.get_event_bindings(776)
+            # messages.debug(f"event_bindings: {event_bindings}")
+
+            # 打印全部事件: index 从 1 到 385
+            # 构建按 index(1-based) 索引的列表，便于后续通过 event_index 直接查找 program
+            total_bindings = len(dx12_all_bindings)
+            dx12_bindings_list = []  # index 0 = event 1
+            exec_count = 0
+            for idx_all, (ek, ev) in enumerate(dx12_all_bindings.items()):
+                idx_1based = idx_all + 1
+                entry = {"call_id": ek, "data": ev}
+                dx12_bindings_list.append(entry)
+                if not isinstance(ev, dict):
+                    messages.debug(f"  [{idx_1based}/{total_bindings}] call_id={ek} type={type(ev).__name__}")
+                    continue
+                has_exec = "execution" in ev
+                if has_exec:
+                    exec_count += 1
+                    prog = ev["execution"].get("program", {})
+                    prog_id = prog.get("id", "?")
+                    stages = [k for k in prog.keys() if k != "id"]
+                    inp_n = len(ev.get("inputs", []))
+                    out_n = len(ev.get("outputs", []))
+                    messages.debug(f"  [{idx_1based}/{total_bindings}] call_id={ek} "
+                                   f"program_id={prog_id} stages={stages} inputs={inp_n} outputs={out_n}")
+                else:
+                    inp_n = len(ev.get("inputs", []))
+                    out_n = len(ev.get("outputs", []))
+                    messages.debug(f"  [{idx_1based}/{total_bindings}] call_id={ek} inputs={inp_n} outputs={out_n}")
+            messages.debug(f"DX12 有 execution 的事件数: {exec_count}/{total_bindings}")
+
+        except Exception as e:
+            messages.error(f"DX12 get_all_event_bindings 加载失败: {e}")
+
     return {
         "api_log": api_log,
         "resources_accessor": resources_accessor,
@@ -2548,10 +2743,15 @@ def _stage_init_session(min_call, max_call, enable_skinning):
         "min_call": min_call,
         "max_call": max_call,
         "enable_skinning": enable_skinning,
+        "dx_version": dx_version,
+        "dx12_all_bindings": dx12_all_bindings,
+        "dx12_bindings_list": dx12_bindings_list if dx_version == "DX12" else [],
+        "dx12_parsed_full": dx12_parsed_full,
         "output_data": {
             "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "filter": {"min_call": min_call, "max_call": max_call},
             "total_count": len(filtered_calls),
+            "dx_version": dx_version,
             "events": []
         },
         "counters": {
@@ -2563,12 +2763,13 @@ def _stage_init_session(min_call, max_call, enable_skinning):
     }
 
 
-def _stage_build_ps_texture_map(bindings, all_calls, call):
+def _stage_build_ps_texture_map(bindings, all_calls, call, dx_version="DX11"):
     """
-    Stage 1 — 解析 PS 纹理绑定
+    Stage 1 — 解析 PS 纹理绑定（兼容 DX11 / DX12）
     
-    1) 从 PS DXBC 解析 slot → name 映射  (如 0 → "tBaseMap")
-    2) 从 PSSetShaderResources 解析 resource_id → slot 映射
+    1) 从 PS DXBC/DXIL 解析 slot → name 映射  (如 0 → "tBaseMap")
+    2) DX11: 从 PSSetShaderResources 解析 resource_id → slot 映射
+       DX12: 按 bindings 中 SRV 纹理顺序推断映射
     3) 合并得到 resource_id → dxbc_name 映射
     
     返回: (dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list)
@@ -2581,10 +2782,10 @@ def _stage_build_ps_texture_map(bindings, all_calls, call):
     if not program_desc:
         return dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list
 
-    # Step 1: 解析 PS DXBC → slot_index → name
-    ps_dxbc = program_desc.get("pixel", {}).get("dxbc", "")
-    if ps_dxbc:
-        for tex in parse_texture_bindings_from_dxbc(ps_dxbc):
+    # Step 1: 解析 PS shader → slot_index → name（DXBC 优先，回退 DXIL）
+    ps_source, src_type = get_shader_source(program_desc, "pixel")
+    if ps_source:
+        for tex in parse_texture_bindings_from_dxbc(ps_source):
             slot, name = tex.get("slot", ""), tex.get("name", "")
             if slot.startswith("t") and name:
                 try:
@@ -2592,26 +2793,29 @@ def _stage_build_ps_texture_map(bindings, all_calls, call):
                 except ValueError:
                     pass
         if dxbc_texture_map:
-            messages.debug(f"DXBC slot->name 映射: {dxbc_texture_map}")
+            messages.debug(f"[{src_type.upper()}] PS slot->name 映射: {dxbc_texture_map}")
 
     if not dxbc_texture_map:
         return dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list
 
-    # Step 2: PSSetShaderResources → resource_id → slot
-    ps_set_srv_calls = find_ps_set_shader_resources_before_event(all_calls, call)
-    if not ps_set_srv_calls:
-        return dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list
+    # Step 2 & 3: 建立 resource_id → dxbc_name
+    resource_id_to_slot = {}
 
-    resource_id_to_slot = build_resource_id_to_slot_map(ps_set_srv_calls)
-    if not resource_id_to_slot:
-        return dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list
+    if dx_version == "DX11":
+        # DX11: PSSetShaderResources → resource_id → slot
+        ps_set_srv_calls = find_ps_set_shader_resources_before_event(all_calls, call)
+        if ps_set_srv_calls:
+            resource_id_to_slot = build_resource_id_to_slot_map(ps_set_srv_calls)
+            if resource_id_to_slot:
+                messages.debug(f"PSSetShaderResources resource_id->slot 映射: {resource_id_to_slot}")
+                resource_id_to_dxbc_name = build_resource_id_to_dxbc_name_map(
+                    resource_id_to_slot, dxbc_texture_map
+                )
+    else:
+        # DX12: 按 bindings 中 SRV 纹理顺序推断
+        resource_id_to_slot, resource_id_to_dxbc_name = \
+            build_dx12_srv_slot_map_from_bindings(bindings, dxbc_texture_map)
 
-    messages.debug(f"PSSetShaderResources resource_id->slot 映射: {resource_id_to_slot}")
-
-    # Step 3: 合并 → resource_id → dxbc_name
-    resource_id_to_dxbc_name = build_resource_id_to_dxbc_name_map(
-        resource_id_to_slot, dxbc_texture_map
-    )
     if resource_id_to_dxbc_name:
         messages.debug(f"最终 resource_id->dxbc_name 映射: {resource_id_to_dxbc_name}")
         for res_id, dxbc_name in resource_id_to_dxbc_name.items():
@@ -2627,15 +2831,15 @@ def _stage_build_ps_texture_map(bindings, all_calls, call):
     return dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list
 
 
-def _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir):
+def _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir, dx_version="DX11"):
     """
-    Stage 2 — 解析 VS CBV 绑定
+    Stage 2 — 解析 VS CBV 绑定（兼容 DX11 / DX12）
     
-    1) 从 VS DXBC 解析 cbuffer slot → name 映射
-    2) 从 VSSetConstantBuffers 解析 slot 绑定
-    3) 与 inputs 中的 CBV 详情交叉匹配
-    4) 输出 vs_cbv_bindings_{program_id_hex}.json
-    5) 查找 Skeleton CBV 信息
+    1) 从 VS DXBC/DXIL 解析 cbuffer slot → name 映射
+    2) DX11: 从 VSSetConstantBuffers 解析 slot 绑定 + inputs CBV 交叉匹配
+       DX12: 按 bindings 中 CBV 顺序推断映射
+    3) 输出 vs_cbv_bindings_{program_id_hex}.json
+    4) 查找 Skeleton CBV 信息
     
     返回: (cbv_bindings, skeleton_cbv_info)
     """
@@ -2647,13 +2851,14 @@ def _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir):
         return cbv_bindings, skeleton_cbv_info
 
     vs_info = program_desc.get("vertex", {})
-    vs_dxbc = vs_info.get("dxbc", "")
-    if not vs_dxbc:
+
+    # Step 1: 解析 VS shader → slot_index → name（DXBC 优先，回退 DXIL）
+    vs_source, src_type = get_shader_source(program_desc, "vertex")
+    if not vs_source:
         return cbv_bindings, skeleton_cbv_info
 
-    # Step 1: VS DXBC → slot_index → name
     dxbc_cbuffer_map = {}
-    for cb in parse_cbuffer_bindings_from_dxbc(vs_dxbc):
+    for cb in parse_cbuffer_bindings_from_dxbc(vs_source):
         slot_index = cb.get("slot_index", -1)
         name = cb.get("name", "")
         if slot_index >= 0 and name:
@@ -2661,62 +2866,67 @@ def _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir):
 
     if not dxbc_cbuffer_map:
         return cbv_bindings, skeleton_cbv_info
-    messages.debug(f"VS DXBC cbuffer slot->name 映射: {dxbc_cbuffer_map}")
+    messages.debug(f"[{src_type.upper()}] VS cbuffer slot->name 映射: {dxbc_cbuffer_map}")
 
-    # Step 2: VSSetConstantBuffers → slot 绑定列表
-    vs_set_cb_calls = find_vs_set_constant_buffers_before_event(all_calls, call)
-    if not vs_set_cb_calls:
-        return cbv_bindings, skeleton_cbv_info
+    # Step 2: 建立 CBV 绑定
+    if dx_version == "DX11":
+        # DX11: VSSetConstantBuffers → slot 绑定 + inputs CBV 交叉匹配
+        vs_set_cb_calls = find_vs_set_constant_buffers_before_event(all_calls, call)
+        if not vs_set_cb_calls:
+            return cbv_bindings, skeleton_cbv_info
 
-    slot_bindings = build_cbv_slot_bindings(vs_set_cb_calls)
-    if not slot_bindings:
-        return cbv_bindings, skeleton_cbv_info
-    messages.debug(f"VSSetConstantBuffers slot绑定: {slot_bindings}")
+        slot_bindings = build_cbv_slot_bindings(vs_set_cb_calls)
+        if not slot_bindings:
+            return cbv_bindings, skeleton_cbv_info
+        messages.debug(f"VSSetConstantBuffers slot绑定: {slot_bindings}")
 
-    # Step 3: 从 inputs 收集 CBV 详情，按 resource_id 分组
-    cbv_by_resource_id = {}
-    for res in bindings.get("inputs", []):
-        res_desc = res.get_description()
-        if res_desc.get("view_type") != "CBV":
-            continue
-        res_id = res_desc.get("resource_id")
-        cbv_by_resource_id.setdefault(res_id, []).append({
-            "view_id": res_desc.get("view_id", 0),
-            "offset": res_desc.get("offset", 0),
-            "stride": res_desc.get("stride", 0),
-            "size": res_desc.get("size", 0),
-            "resource_type": res_desc.get("resource_type", "buffer")
-        })
-    messages.debug(f"CBV resource_id->详情列表: {cbv_by_resource_id}")
+        # 从 inputs 收集 CBV 详情，按 resource_id 分组
+        cbv_by_resource_id = {}
+        for res in bindings.get("inputs", []):
+            res_desc = res.get_description()
+            if res_desc.get("view_type") != "CBV":
+                continue
+            res_id = res_desc.get("resource_id")
+            cbv_by_resource_id.setdefault(res_id, []).append({
+                "view_id": res_desc.get("view_id", 0),
+                "offset": res_desc.get("offset", 0),
+                "stride": res_desc.get("stride", 0),
+                "size": res_desc.get("size", 0),
+                "resource_type": res_desc.get("resource_type", "buffer")
+            })
+        messages.debug(f"CBV resource_id->详情列表: {cbv_by_resource_id}")
 
-    # Step 4: 合并 slot_bindings + cbv_by_resource_id → cbv_bindings
-    consumed = {}  # resource_id → 已消耗的 view 索引
-    for binding in slot_bindings:
-        slot_index = binding["slot_index"]
-        resource_id = binding["resource_id"]
-        dxbc_name = dxbc_cbuffer_map.get(slot_index, "")
+        consumed = {}
+        for binding in slot_bindings:
+            slot_index = binding["slot_index"]
+            resource_id = binding["resource_id"]
+            dxbc_name = dxbc_cbuffer_map.get(slot_index, "")
 
-        cbv_list = cbv_by_resource_id.get(resource_id, [])
-        ci = consumed.get(resource_id, 0)
-        cbv_detail = cbv_list[ci] if ci < len(cbv_list) else {}
-        consumed[resource_id] = ci + 1
+            cbv_list = cbv_by_resource_id.get(resource_id, [])
+            ci = consumed.get(resource_id, 0)
+            cbv_detail = cbv_list[ci] if ci < len(cbv_list) else {}
+            consumed[resource_id] = ci + 1
 
-        view_id = cbv_detail.get("view_id", 0)
-        cbv_bindings.append({
-            "slot": f"cb{slot_index}",
-            "slot_index": slot_index,
-            "dxbc_name": dxbc_name,
-            "resource_id": resource_id,
-            "resource_id_hex": f"{resource_id:X}" if resource_id else "",
-            "view_id": view_id,
-            "view_id_hex": f"{view_id:X}" if view_id else "",
-            "offset": cbv_detail.get("offset", 0),
-            "stride": cbv_detail.get("stride", 0),
-            "size": cbv_detail.get("size", 0),
-            "resource_type": cbv_detail.get("resource_type", "buffer")
-        })
+            view_id = cbv_detail.get("view_id", 0)
+            cbv_bindings.append({
+                "slot": f"cb{slot_index}",
+                "slot_index": slot_index,
+                "dxbc_name": dxbc_name,
+                "resource_id": resource_id,
+                "resource_id_hex": f"{resource_id:X}" if resource_id else "",
+                "view_id": view_id,
+                "view_id_hex": f"{view_id:X}" if view_id else "",
+                "offset": cbv_detail.get("offset", 0),
+                "stride": cbv_detail.get("stride", 0),
+                "size": cbv_detail.get("size", 0),
+                "resource_type": cbv_detail.get("resource_type", "buffer")
+            })
+    else:
+        # DX12: 按 bindings 中 CBV 顺序推断
+        cbv_bindings, skeleton_cbv_info = \
+            build_dx12_cbv_bindings_from_bindings(bindings, dxbc_cbuffer_map)
 
-    # Step 5: 输出 JSON
+    # Step 3: 输出 JSON
     vs_program_id = vs_info.get("hash", "") or program_desc.get("id", "unknown")
     vs_program_id_hex = f"{vs_program_id:X}" if isinstance(vs_program_id, int) else str(vs_program_id)
     vs_cbv_json_file = os.path.join(event_dir, f"vs_cbv_bindings_{vs_program_id_hex}.json")
@@ -2729,12 +2939,13 @@ def _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir):
         }, f, indent=2, ensure_ascii=False)
     messages.debug(f"VS CBV 绑定映射已保存到: {vs_cbv_json_file}")
 
-    # Step 6: 查找 Skeleton
-    for b in cbv_bindings:
-        if b.get("dxbc_name") == "Skeleton":
-            skeleton_cbv_info = {"resource_id": b["resource_id"], "view_id": b["view_id"]}
-            messages.debug(f"找到 Skeleton CBV: resource_id={skeleton_cbv_info['resource_id']}, view_id={skeleton_cbv_info['view_id']}")
-            break
+    # Step 4: 查找 Skeleton（DX11 路径中还未设置 skeleton_cbv_info）
+    if skeleton_cbv_info is None:
+        for b in cbv_bindings:
+            if b.get("dxbc_name") == "Skeleton":
+                skeleton_cbv_info = {"resource_id": b["resource_id"], "view_id": b["view_id"]}
+                messages.debug(f"找到 Skeleton CBV: resource_id={skeleton_cbv_info['resource_id']}, view_id={skeleton_cbv_info['view_id']}")
+                break
 
     return cbv_bindings, skeleton_cbv_info
 
@@ -2782,6 +2993,7 @@ def _stage_export_textures(resources_accessor, srv_textures, call, event_dir,
         res_desc = res.get_description()
         res_id = res_desc.get("resource_id")
         res_id_str = str(res_id)
+        res_id_hex = format(int(res_id), 'X') if str(res_id).isdigit() else str(res_id)
 
         dxbc_name = ""
         dxbc_slot = -1
@@ -2793,18 +3005,33 @@ def _stage_export_textures(resources_accessor, srv_textures, call, event_dir,
                     break
             messages.debug(f"资源 {res_id} 通过 PSSetShaderResources 映射到 {dxbc_name} (t{dxbc_slot})")
 
+        mips = res_desc.get("mips", [])
+        width = mips[0].get("width", 0) if mips else 0
+        height = mips[0].get("height", 0) if mips else 0
+        tex_format = res_desc.get("format", "unknown")
+        view_type = res_desc.get("view_type", "")
+
         tex_file = export_texture(
             resources_accessor, res, call, event_dir, res_id_str, dxbc_name=dxbc_name
         )
+
+        record = {
+            "type": "input",
+            "resource_id": res_id_str,
+            "resource_id_hex": res_id_hex,
+            "resource_type": res_desc.get("resource_type", ""),
+            "view_type": view_type,
+            "format": tex_format,
+            "width": width,
+            "height": height,
+            "mip_count": len(mips),
+            "dxbc_name": dxbc_name,
+            "dxbc_slot": f"t{dxbc_slot}" if dxbc_slot >= 0 else "",
+            "order_index": tex_idx,
+            "file": os.path.basename(tex_file) if tex_file else None
+        }
+        exported.append(record)
         if tex_file:
-            exported.append({
-                "type": "input",
-                "resource_id": res_id_str,
-                "dxbc_name": dxbc_name,
-                "dxbc_slot": f"t{dxbc_slot}" if dxbc_slot >= 0 else "",
-                "order_index": tex_idx,
-                "file": os.path.basename(tex_file)
-            })
             count += 1
 
     return exported, count
@@ -2833,13 +3060,22 @@ def _stage_export_other_inputs(resources_accessor, other_inputs, call, event_dir
         view_type = res_desc.get("view_type", "")
 
         if resource_type == "texture":
+            res_id_hex = format(int(res_id), 'X') if res_id.isdigit() else res_id
+            mips = res_desc.get("mips", [])
             tex_file = export_texture(resources_accessor, res, call, event_dir, res_id)
+            exported_textures.append({
+                "type": "input",
+                "resource_id": res_id,
+                "resource_id_hex": res_id_hex,
+                "resource_type": resource_type,
+                "view_type": view_type,
+                "format": res_desc.get("format", "unknown"),
+                "width": mips[0].get("width", 0) if mips else 0,
+                "height": mips[0].get("height", 0) if mips else 0,
+                "mip_count": len(mips),
+                "file": os.path.basename(tex_file) if tex_file else None
+            })
             if tex_file:
-                exported_textures.append({
-                    "type": "input",
-                    "resource_id": res_id,
-                    "file": os.path.basename(tex_file)
-                })
                 tex_count += 1
 
         elif resource_type == "buffer":
@@ -2852,11 +3088,17 @@ def _stage_export_other_inputs(resources_accessor, other_inputs, call, event_dir
                 cbv_resources.append(res)
                 continue
 
+            buf_desc_id = res_desc.get("resource_id")
+            buf_id_hex = format(int(buf_desc_id), 'X') if str(buf_desc_id).isdigit() else str(buf_desc_id)
             buf_file = export_buffer(resources_accessor, res, call, event_dir, res_id)
             if buf_file:
                 exported_buffers.append({
                     "type": "input",
                     "resource_id": res_id,
+                    "resource_id_hex": buf_id_hex,
+                    "view_type": view_type,
+                    "stride": res_desc.get("stride", 0),
+                    "size": res_desc.get("size", 0),
                     "file": os.path.basename(buf_file)
                 })
                 buf_count += 1
@@ -2920,7 +3162,8 @@ def _stage_extract_indirect_args(desc, bindings, resources_accessor, call):
         return None
 
     try:
-        args_request = BufferRequest(buffer=args_buffer, call=call, extract_before=False)
+        actual_args = _unwrap_dx12_resource(args_buffer)
+        args_request = BufferRequest(buffer=actual_args, call=call, extract_before=False)
         args_result = resources_accessor.get_buffers_data([args_request], timeout=30000)
         if args_request not in args_result:
             messages.debug("读取 args buffer 失败")
@@ -2999,8 +3242,14 @@ def _stage_save_event_info(event_dir, event_index, call_id, desc, bindings, even
             "has_program": "program" in bindings.get("execution", {}),
             "has_geometry": "input_geometry" in bindings.get("metadata", {}),
             "shaders_exported": len(event_data.get("exported_shaders", []))
-        }
+        },
+        "textures": event_data.get("exported_textures", []),
+        "texture_binding_map": event_data.get("texture_binding_map", []),
+        "buffers": event_data.get("exported_buffers", []),
+        "shaders": event_data.get("exported_shaders", []),
     }
+    if event_data.get("exported_mesh"):
+        info["mesh"] = event_data["exported_mesh"]
     if "indirect_args" in event_data:
         info["indirect_args"] = event_data["indirect_args"]
 
@@ -3015,6 +3264,344 @@ def _get_program_desc(bindings):
     if "program" not in exe:
         return None
     return exe["program"].get_description()
+
+
+# =============================================================================
+# DX11 事件处理流程
+# =============================================================================
+
+def _process_event_dx11(ctx, call, desc, event_dir, event_index,
+                        event_data, all_calls, resources_accessor, enable_skinning):
+    """DX11 事件处理: 通过 get_bindings() 获取所有资源绑定信息"""
+    call_id = desc.get("id")
+    bindings = call.get_bindings()
+
+    # Stage 1: PS 纹理绑定
+    dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list = \
+        _stage_build_ps_texture_map(bindings, all_calls, call, "DX11")
+    event_data["texture_binding_map"] = texture_binding_list
+
+    # Stage 2: VS CBV 绑定
+    cbv_bindings, skeleton_cbv_info = \
+        _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir, "DX11")
+
+    # Stage 3: 分类输入资源
+    srv_textures, other_inputs = _stage_classify_inputs(bindings)
+
+    # Stage 4: 导出 SRV 纹理
+    tex_exported, tex_count = _stage_export_textures(
+        resources_accessor, srv_textures, call, event_dir,
+        resource_id_to_dxbc_name, dxbc_texture_map
+    )
+    event_data["exported_textures"].extend(tex_exported)
+    ctx["counters"]["textures"] += tex_count
+
+    # Stage 5: 导出其他输入 + 收集 IBV/VBV/CBV
+    (other_tex, other_tex_cnt,
+     other_buf, other_buf_cnt,
+     ibv_resource, vbv_resources, cbv_resources) = \
+        _stage_export_other_inputs(resources_accessor, other_inputs, call, event_dir)
+    event_data["exported_textures"].extend(other_tex)
+    event_data["exported_buffers"].extend(other_buf)
+    ctx["counters"]["textures"] += other_tex_cnt
+    ctx["counters"]["buffers"] += other_buf_cnt
+
+    # Stage 6: 合并 VBV
+    vbv_record = _stage_export_vbv(vbv_resources, event_dir)
+    if vbv_record:
+        event_data["exported_buffers"].append(vbv_record)
+
+    # Stage 7: Indirect Args
+    indirect_args = _stage_extract_indirect_args(
+        desc, bindings, resources_accessor, call
+    )
+    if indirect_args:
+        event_data["indirect_args"] = indirect_args
+
+    # Stage 8: Mesh
+    mesh_file = _stage_export_mesh(
+        resources_accessor, ibv_resource, vbv_resources, cbv_resources,
+        call, event_dir, event_index, desc,
+        enable_skinning, skeleton_cbv_info, indirect_args, bindings
+    )
+    if mesh_file:
+        event_data["exported_mesh"] = mesh_file
+        ctx["counters"]["meshes"] += 1
+
+    # Stage 9: Shader
+    shader_records, shader_count = _stage_export_event_shaders(
+        bindings, event_dir, event_index
+    )
+    event_data["exported_shaders"] = shader_records
+    ctx["counters"]["shaders"] += shader_count
+
+    # Stage 10: 保存事件信息
+    _stage_save_event_info(event_dir, event_index, call_id, desc, bindings, event_data)
+
+
+# =============================================================================
+# DX12 事件处理流程
+# =============================================================================
+
+class _DX12ResourceProxy:
+    """将 dict 描述包装为类似 DX11 MemoryResource 的对象，提供 get_description()。
+    透过 __getattr__ 将未定义的属性/方法调用转发给底层 MemoryResource，
+    使 ImageRequest / BufferRequest 等构造函数能正常使用。"""
+    def __init__(self, desc_dict, mem_resource=None):
+        self._desc = desc_dict
+        self._mem_resource = mem_resource
+
+    def get_description(self):
+        return self._desc
+
+    def get_image_data(self, *args, **kwargs):
+        if self._mem_resource:
+            try:
+                return self._mem_resource.get_image_data(*args, **kwargs)
+            except UnicodeDecodeError as e:
+                raise RuntimeError(f"DX12 get_image_data UnicodeDecodeError: {e}")
+        raise RuntimeError("No underlying MemoryResource")
+
+    def get_buffer_data(self, *args, **kwargs):
+        if self._mem_resource:
+            try:
+                return self._mem_resource.get_buffer_data(*args, **kwargs)
+            except UnicodeDecodeError as e:
+                raise RuntimeError(f"DX12 get_buffer_data UnicodeDecodeError: {e}")
+        raise RuntimeError("No underlying MemoryResource")
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        if self._mem_resource is not None:
+            return getattr(self._mem_resource, name)
+        raise AttributeError(f"_DX12ResourceProxy has no attribute '{name}' and no underlying MemoryResource")
+
+
+class _DX12ProgramProxy:
+    """包装 program description 为类似 DX11 Program 的对象，同时代理 get_il_source。
+    DX12 的 get_il_source 直接从缓存的 description 中返回 DXIL/DXBC 文本，
+    避免调用原生 API（原生调用会触发 UnicodeDecodeError 并破坏连接状态）。"""
+    def __init__(self, desc_dict, program_obj=None):
+        self._desc = desc_dict
+        self._program = program_obj
+
+    def get_description(self):
+        return self._desc
+
+    def get_il_source(self, shader_type="vertex", il_type="dxil", **kwargs):
+        stage_info = self._desc.get(shader_type, {})
+        if isinstance(stage_info, dict):
+            source = stage_info.get(il_type, "")
+            if source:
+                return source
+        return None
+
+
+def _unwrap_dx12_resource(res):
+    """如果 res 是 _DX12ResourceProxy，返回底层 MemoryResource；否则原样返回"""
+    if isinstance(res, _DX12ResourceProxy) and res._mem_resource is not None:
+        return res._mem_resource
+    return res
+
+
+def _dx12_build_bindings(ctx, call, event_index):
+    """
+    DX12: 从预加载的 all_bindings 中构建 bindings dict，
+    结构与 DX11 的 call.get_bindings() 兼容。
+    """
+    call_id = str(call.get_description().get("id"))
+    dx12_all_bindings = ctx.get("dx12_all_bindings", {})
+    event_bindings = dx12_all_bindings.get(call_id, {})
+
+    if not event_bindings:
+        messages.warning(f"[g_{event_index}] DX12 bindings 中未找到 event_id={call_id}")
+        return {"inputs": [], "outputs": []}
+
+    # 构建 memory_resource 查找表: resource_id -> {view_type -> MemoryResource}
+    if "_dx12_mem_res_map" not in ctx:
+        mem_res = ctx["resources_accessor"].get_memory_resources()
+        res_map = {}
+        for rkey, res_list in mem_res.items():
+            if not isinstance(res_list, list):
+                continue
+            for item in res_list:
+                try:
+                    d = item.get_description()
+                    rid = d.get("resource_id")
+                    vt = d.get("view_type")
+                    vid = d.get("view_id")
+                    key = (rid, vt, vid)
+                    res_map[key] = item
+                except Exception:
+                    pass
+        ctx["_dx12_mem_res_map"] = res_map
+        messages.debug(f"DX12 MemoryResource 查找表: {len(res_map)} 个条目")
+
+    res_map = ctx["_dx12_mem_res_map"]
+
+    # 包装 inputs
+    inputs = []
+    for inp_desc in event_bindings.get("inputs", []):
+        rid = inp_desc.get("resource_id")
+        vt = inp_desc.get("view_type")
+        vid = inp_desc.get("view_id")
+        mem_res = res_map.get((rid, vt, vid))
+        inputs.append(_DX12ResourceProxy(inp_desc, mem_res))
+
+    # 包装 outputs
+    outputs = []
+    for out_desc in event_bindings.get("outputs", []):
+        rid = out_desc.get("resource_id")
+        vt = out_desc.get("view_type")
+        vid = out_desc.get("view_id")
+        mem_res = res_map.get((rid, vt, vid))
+        outputs.append(_DX12ResourceProxy(out_desc, mem_res))
+
+    bindings = {"inputs": inputs, "outputs": outputs}
+
+    # 诊断: 首次处理时记录 event_bindings 的顶级 key
+    if "_dx12_eb_keys_logged" not in ctx:
+        ctx["_dx12_eb_keys_logged"] = True
+        eb_keys = list(event_bindings.keys())
+        messages.debug(f"DX12 event_bindings 顶级 keys: {eb_keys}")
+        for k in eb_keys:
+            v = event_bindings[k]
+            if isinstance(v, list):
+                messages.debug(f"  {k}: list[{len(v)}]")
+            elif isinstance(v, dict):
+                messages.debug(f"  {k}: dict keys={list(v.keys())[:5]}")
+            else:
+                messages.debug(f"  {k}: {type(v).__name__} = {str(v)[:100]}")
+
+    # 查找 program: 通过 SetPipelineState 匹配 PSO -> Program
+    if "_dx12_programs" not in ctx:
+        ctx["_dx12_programs"] = ctx["resources_accessor"].get_programs()
+
+    # 构建 program_id -> Program 及 program_desc 查找表（仅一次）
+    if "_dx12_prog_map" not in ctx:
+        prog_map = {}
+        for p in ctx["_dx12_programs"]:
+            try:
+                pd = p.get_description()
+                pid = pd.get("id")
+                if pid is not None:
+                    prog_map[pid] = (pd, p)
+            except Exception:
+                pass
+        ctx["_dx12_prog_map"] = prog_map
+        messages.debug(f"DX12 Program 查找表: {len(prog_map)} 个 (ids: {list(prog_map.keys())[:10]}...)")
+
+    prog_map = ctx["_dx12_prog_map"]
+
+    # 通过 dx12_bindings_list 按 event_index 查找 program
+    # 只检查当前 event_index 对应的位置，没有 execution 则该事件无 program，不输出 dxil
+    bindings_list = ctx.get("dx12_bindings_list", [])
+    matched_method = None
+
+    list_idx = event_index - 1  # 转为 0-based
+    if 0 <= list_idx < len(bindings_list):
+        entry = bindings_list[list_idx]
+        ev_data = entry["data"]
+        if isinstance(ev_data, dict):
+            exec_info = ev_data.get("execution", {})
+            prog_desc = exec_info.get("program") if isinstance(exec_info, dict) else None
+            if prog_desc and isinstance(prog_desc, dict) and ("vertex" in prog_desc or "pixel" in prog_desc):
+                prog_id = prog_desc.get("id")
+                native_prog_entry = prog_map.get(prog_id) if prog_id else None
+                if native_prog_entry:
+                    native_pd, native_prog = native_prog_entry
+                    bindings["execution"] = {"program": _DX12ProgramProxy(native_pd, native_prog)}
+                else:
+                    bindings["execution"] = {"program": _DX12ProgramProxy(prog_desc, None)}
+                matched_method = f"bindings_list[{event_index}](call_id={entry['call_id']})"
+
+    if "execution" in bindings:
+        pd = bindings["execution"]["program"].get_description()
+        stages = [k for k in pd.keys() if k != 'id']
+        messages.debug(f"[g_{event_index}] DX12 program 匹配: method={matched_method}, "
+                       f"id={pd.get('id')}, stages={stages}")
+    else:
+        messages.debug(f"[g_{event_index}] DX12 未找到匹配的 program")
+
+    messages.debug(f"[g_{event_index}] DX12 bindings 构建: inputs={len(inputs)}, "
+                   f"outputs={len(outputs)}, has_program={'execution' in bindings}")
+
+    return bindings
+
+
+def _process_event_dx12(ctx, call, desc, event_dir, event_index,
+                        event_data, all_calls, resources_accessor, enable_skinning):
+    """DX12 事件处理: 通过预加载的 all_bindings 获取资源绑定信息"""
+    call_id = desc.get("id")
+    messages.info(f"[g_{event_index}] DX12 模式处理事件: {desc.get('name')} (id={call_id})")
+
+    # 构建兼容 DX11 的 bindings 结构
+    bindings = _dx12_build_bindings(ctx, call, event_index)
+
+    # Stage 1: PS 纹理绑定
+    dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list = \
+        _stage_build_ps_texture_map(bindings, all_calls, call, "DX12")
+    event_data["texture_binding_map"] = texture_binding_list
+
+    # Stage 2: VS CBV 绑定
+    cbv_bindings, skeleton_cbv_info = \
+        _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir, "DX12")
+
+    # Stage 3: 分类输入资源
+    srv_textures, other_inputs = _stage_classify_inputs(bindings)
+
+    # Stage 4: 导出 SRV 纹理
+    tex_exported, tex_count = _stage_export_textures(
+        resources_accessor, srv_textures, call, event_dir,
+        resource_id_to_dxbc_name, dxbc_texture_map
+    )
+    event_data["exported_textures"].extend(tex_exported)
+    ctx["counters"]["textures"] += tex_count
+
+    # Stage 5: 导出其他输入 + 收集 IBV/VBV/CBV
+    (other_tex, other_tex_cnt,
+     other_buf, other_buf_cnt,
+     ibv_resource, vbv_resources, cbv_resources) = \
+        _stage_export_other_inputs(resources_accessor, other_inputs, call, event_dir)
+    event_data["exported_textures"].extend(other_tex)
+    event_data["exported_buffers"].extend(other_buf)
+    ctx["counters"]["textures"] += other_tex_cnt
+    ctx["counters"]["buffers"] += other_buf_cnt
+
+    # Stage 6: 合并 VBV
+    vbv_record = _stage_export_vbv(vbv_resources, event_dir)
+    if vbv_record:
+        event_data["exported_buffers"].append(vbv_record)
+
+    # Stage 7: Indirect Args
+    indirect_args = _stage_extract_indirect_args(
+        desc, bindings, resources_accessor, call
+    )
+    if indirect_args:
+        event_data["indirect_args"] = indirect_args
+
+    # Stage 8: Mesh
+    mesh_file = _stage_export_mesh(
+        resources_accessor, ibv_resource, vbv_resources, cbv_resources,
+        call, event_dir, event_index, desc,
+        enable_skinning, skeleton_cbv_info, indirect_args, bindings
+    )
+    if mesh_file:
+        event_data["exported_mesh"] = mesh_file
+        ctx["counters"]["meshes"] += 1
+
+    # Stage 9: Shader
+    shader_records, shader_count = _stage_export_event_shaders(
+        bindings, event_dir, event_index
+    )
+    event_data["exported_shaders"] = shader_records
+    ctx["counters"]["shaders"] += shader_count
+
+    # Stage 10: 保存事件信息
+    _stage_save_event_info(event_dir, event_index, call_id, desc, bindings, event_data)
+
+
 
 
 # =============================================================================
@@ -3040,6 +3627,8 @@ def _process_single_event(ctx, loop_idx, call):
     call_id = desc.get("id")
     event_index = max(1, ctx["min_call"]) + loop_idx
 
+    messages.debug(f"[g_{event_index}] call.get_description(): {json.dumps(desc, default=str, ensure_ascii=False)}")
+
     event_dir = os.path.join(ctx["resources_dir"], f"g_{event_index}")
     if not os.path.exists(event_dir):
         os.makedirs(event_dir)
@@ -3056,76 +3645,24 @@ def _process_single_event(ctx, loop_idx, call):
     }
 
     try:
-        bindings = call.get_bindings()
         all_calls = ctx["all_calls"]
         resources_accessor = ctx["resources_accessor"]
         enable_skinning = ctx["enable_skinning"]
+        dx_version = ctx.get("dx_version", "DX11")
 
-        # Stage 1: PS 纹理绑定
-        dxbc_texture_map, resource_id_to_dxbc_name, texture_binding_list = \
-            _stage_build_ps_texture_map(bindings, all_calls, call)
-        event_data["texture_binding_map"] = texture_binding_list
-
-        # Stage 2: VS CBV 绑定
-        cbv_bindings, skeleton_cbv_info = \
-            _stage_build_vs_cbv_map(bindings, all_calls, call, event_dir)
-
-        # Stage 3: 分类输入资源
-        srv_textures, other_inputs = _stage_classify_inputs(bindings)
-
-        # Stage 4: 导出 SRV 纹理
-        tex_exported, tex_count = _stage_export_textures(
-            resources_accessor, srv_textures, call, event_dir,
-            resource_id_to_dxbc_name, dxbc_texture_map
-        )
-        event_data["exported_textures"].extend(tex_exported)
-        ctx["counters"]["textures"] += tex_count
-
-        # Stage 5: 导出其他输入 + 收集 IBV/VBV/CBV
-        (other_tex, other_tex_cnt,
-         other_buf, other_buf_cnt,
-         ibv_resource, vbv_resources, cbv_resources) = \
-            _stage_export_other_inputs(resources_accessor, other_inputs, call, event_dir)
-        event_data["exported_textures"].extend(other_tex)
-        event_data["exported_buffers"].extend(other_buf)
-        ctx["counters"]["textures"] += other_tex_cnt
-        ctx["counters"]["buffers"] += other_buf_cnt
-
-        # Stage 6: 合并 VBV
-        vbv_record = _stage_export_vbv(vbv_resources, event_dir)
-        if vbv_record:
-            event_data["exported_buffers"].append(vbv_record)
-
-        # Stage 7: Indirect Args
-        indirect_args = _stage_extract_indirect_args(
-            desc, bindings, resources_accessor, call
-        )
-        if indirect_args:
-            event_data["indirect_args"] = indirect_args
-
-        # Stage 8: Mesh
-        mesh_file = _stage_export_mesh(
-            resources_accessor, ibv_resource, vbv_resources, cbv_resources,
-            call, event_dir, event_index, desc,
-            enable_skinning, skeleton_cbv_info, indirect_args, bindings
-        )
-        if mesh_file:
-            event_data["exported_mesh"] = mesh_file
-            ctx["counters"]["meshes"] += 1
-
-        # Stage 9: Shader
-        shader_records, shader_count = _stage_export_event_shaders(
-            bindings, event_dir, event_index
-        )
-        event_data["exported_shaders"] = shader_records
-        ctx["counters"]["shaders"] += shader_count
-
-        # Stage 10: 保存事件信息
-        _stage_save_event_info(event_dir, event_index, call_id, desc, bindings, event_data)
+        if dx_version == "DX11":
+            _process_event_dx11(ctx, call, desc, event_dir, event_index,
+                                event_data, all_calls, resources_accessor, enable_skinning)
+        else:
+            _process_event_dx12(ctx, call, desc, event_dir, event_index,
+                                event_data, all_calls, resources_accessor, enable_skinning)
 
     except Exception as e:
+        import traceback
+        tb_str = traceback.format_exc()
         event_data["error"] = str(e)
-        messages.debug(f"处理 event {call_id} 失败: {str(e)}")
+        messages.error(f"处理 event {call_id} 失败: {str(e)}")
+        messages.error(f"堆栈:\n{tb_str}")
 
     ctx["output_data"]["events"].append(event_data)
 
